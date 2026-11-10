@@ -45,6 +45,17 @@
       <!-- Login Form -->
       <form @submit.prevent="handleLogin" class="bento-form">
         <div class="input-field-group">
+          <label>Tenant / Branch Slug</label>
+          <input
+            v-model="tenantSlug"
+            type="text"
+            required
+            class="bento-text-input font-data-mono"
+            placeholder="e.g. aunts-lusaka"
+          />
+        </div>
+
+        <div class="input-field-group">
           <label>Username</label>
           <input
             v-model="username"
@@ -92,6 +103,7 @@ import {
 import { api } from '../services/api.js';
 import { authState } from '../stores/auth.js';
 
+const tenantSlug = ref('aunts-lusaka');
 const username = ref('cashier1');
 const password = ref('cashier123');
 const isLoading = ref(false);
@@ -108,8 +120,18 @@ const handleLogin = async () => {
   errorMessage.value = '';
 
   try {
-    const res = await api.login(username.value, password.value);
-    authState.login({ id: res.id, username: res.username, role: res.role }, res.token);
+    const res = await api.login(tenantSlug.value, username.value, password.value);
+    authState.login(
+      {
+        id: res.id,
+        tenant_id: res.tenant_id,
+        tenant_slug: res.tenant_slug,
+        username: res.username,
+        role: res.role,
+      },
+      res.access_token || res.token,
+      res.refresh_token
+    );
   } catch (err) {
     errorMessage.value = err.message || 'Login failed. Please verify credentials.';
   } finally {

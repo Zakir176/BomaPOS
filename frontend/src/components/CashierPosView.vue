@@ -445,7 +445,6 @@ const handleCashCheckout = async () => {
   isProcessingOrder.value = true;
   try {
     const payload = {
-      cashier_id: authState.user.id,
       payment_method: 'cash',
       items: cartState.items.map((i) => ({
         menu_item_id: i.id,

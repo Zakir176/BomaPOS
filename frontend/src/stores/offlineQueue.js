@@ -1,4 +1,5 @@
 import { reactive, computed } from 'vue';
+import { API_BASE, getAuthHeader, tryRefreshToken } from '../services/api.js';
 
 const STORAGE_KEY = 'bomapos_offline_orders';
 
@@ -25,6 +26,7 @@ export const offlineQueue = reactive({
   isOnline: navigator.onLine,
   isSimulatedOffline: false,
   isSyncing: false,
+  needsReauth: false,
   lastSyncTime: null,
   lastSyncResult: null,
   queue: loadStoredQueue(),
@@ -56,7 +58,10 @@ export const offlineQueue = reactive({
   // Save an order locally
   enqueueOrder(payload, itemsDetail = []) {
     const localId = `OFFLINE-${Date.now().toString().slice(-6)}-${Math.floor(Math.random() * 899 + 100)}`;
-    
+
+    const cleanPayload = { ...payload };
+    delete cleanPayload.cashier_id;
+
     // Calculate total amount from itemsDetail
     const totalAmount = itemsDetail.reduce(
       (sum, item) => sum + (item.price_zmw || item.price || 0) * (item.quantity || 1),
@@ -65,7 +70,7 @@ export const offlineQueue = reactive({
 
     const queuedRecord = {
       localId,
-      payload: { ...payload },
+      payload: cleanPayload,
       itemsDetail: itemsDetail.map((i) => ({
         id: i.id,
         name: i.name,
@@ -89,10 +94,9 @@ export const offlineQueue = reactive({
     return {
       id: localId,
       is_offline: true,
-      cashier_id: payload.cashier_id,
       total_amount: queuedRecord.totalAmount,
-      payment_method: payload.payment_method,
-      payment_status: payload.payment_method === 'cash' ? 'paid (offline)' : 'pending (offline)',
+      payment_method: cleanPayload.payment_method,
+      payment_status: cleanPayload.payment_method === 'cash' ? 'paid (offline)' : 'pending (offline)',
       created_at: queuedRecord.createdAt,
       items: queuedRecord.itemsDetail,
       message: 'Saved offline. Will sync when online.',
@@ -112,31 +116,58 @@ export const offlineQueue = reactive({
 
     offlineQueue.isSyncing = true;
     offlineQueue.lastSyncResult = null;
+    offlineQueue.needsReauth = false;
     let syncedCount = 0;
     const remainingQueue = [];
 
-    const token = localStorage.getItem('bomapos_token');
-    const headers = {
-      'Content-Type': 'application/json',
-      ...(token ? { 'X-Auth-Token': token } : {}),
-    };
-
     console.log(`[OfflineQueue] Beginning background sync for ${offlineQueue.queue.length} order(s)...`);
 
-    for (const order of offlineQueue.queue) {
+    for (let i = 0; i < offlineQueue.queue.length; i++) {
+      const order = offlineQueue.queue[i];
       try {
-        const response = await fetch('http://localhost:8000/api/orders', {
+        const cleanPayload = { ...order.payload };
+        delete cleanPayload.cashier_id;
+
+        let response = await fetch(`${API_BASE}/api/orders`, {
           method: 'POST',
-          headers,
-          body: JSON.stringify(order.payload),
+          headers: {
+            'Content-Type': 'application/json',
+            ...getAuthHeader(),
+          },
+          body: JSON.stringify(cleanPayload),
         });
+
+        // If access token expired during offline window, attempt refresh once
+        if (response.status === 401) {
+          const refreshed = await tryRefreshToken();
+          if (refreshed) {
+            response = await fetch(`${API_BASE}/api/orders`, {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                ...getAuthHeader(),
+              },
+              body: JSON.stringify(cleanPayload),
+            });
+          }
+        }
 
         if (response.ok) {
           const result = await response.json();
           syncedCount++;
           console.log(`[OfflineQueue] Order ${order.localId} successfully synced -> Server Ticket #${result.id}`);
+        } else if (response.status === 401) {
+          // Critical: Expired/revoked token must NEVER discard queued orders.
+          // Preserve this order and all subsequent orders in pending state to flush after re-authentication.
+          console.warn(`[OfflineQueue] Token expired while syncing ${order.localId}. Keeping ${offlineQueue.queue.length - i} order(s) queued until re-authentication.`);
+          offlineQueue.needsReauth = true;
+          for (let j = i; j < offlineQueue.queue.length; j++) {
+            offlineQueue.queue[j].status = 'pending_auth';
+            remainingQueue.push(offlineQueue.queue[j]);
+          }
+          break;
         } else {
-          // If server returned non-200 (e.g. 400 Bad Request or 401 Unauthorized), log and keep for inspection
+          // Non-auth server error (e.g. 400 Bad Request), keep in queue for inspection
           const errData = await response.json().catch(() => ({}));
           console.error(`[OfflineQueue] Sync failed for ${order.localId}:`, errData);
           order.retryCount = (order.retryCount || 0) + 1;
@@ -146,8 +177,9 @@ export const offlineQueue = reactive({
         }
       } catch (networkErr) {
         console.warn(`[OfflineQueue] Network error syncing ${order.localId}. Aborting sync cycle.`, networkErr);
-        // Put current and all subsequent orders back into remainingQueue
-        remainingQueue.push(order);
+        for (let j = i; j < offlineQueue.queue.length; j++) {
+          remainingQueue.push(offlineQueue.queue[j]);
+        }
         break;
       }
     }
@@ -163,11 +195,15 @@ export const offlineQueue = reactive({
 
     if (syncedCount > 0) {
       offlineQueue.lastSyncResult = `Successfully synced ${syncedCount} offline order${syncedCount > 1 ? 's' : ''} to database.`;
-      // Dispatch custom DOM event so views can refresh menu/analytics
       window.dispatchEvent(new CustomEvent('bomapos:queue-synced', { detail: { count: syncedCount } }));
     }
 
-    return { success: true, syncedCount, remainingCount: remainingQueue.length };
+    return {
+      success: !offlineQueue.needsReauth,
+      syncedCount,
+      remainingCount: remainingQueue.length,
+      needsReauth: offlineQueue.needsReauth,
+    };
   },
 
   // Clear failed orders or wipe queue manually
@@ -181,7 +217,6 @@ export const offlineQueue = reactive({
 window.addEventListener('online', () => {
   console.log('[OfflineQueue] Window "online" event received. Network restored.');
   offlineQueue.isOnline = true;
-  // Delay slightly to ensure network stack is fully ready
   setTimeout(() => {
     offlineQueue.syncQueue();
   }, 600);

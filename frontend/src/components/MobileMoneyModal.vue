@@ -316,7 +316,6 @@ const handleInitiate = async () => {
 
   try {
     const orderPayload = {
-      cashier_id: authState.user.id,
       payment_method: 'mobile_money',
       items: cartState.items.map((i) => ({
         menu_item_id: i.id,

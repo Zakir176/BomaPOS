@@ -1,21 +1,46 @@
 from datetime import datetime
-from typing import List, Literal, Optional
-from pydantic import BaseModel, ConfigDict, Field
+from decimal import Decimal
+from typing import Any, List, Literal, Optional
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+try:
+    from .money import zmw_to_ngwee, ngwee_to_zmw
+except ImportError:
+    from money import zmw_to_ngwee, ngwee_to_zmw
 
 
 # ---------------------------------------------------------
 # Auth Schemas
 # ---------------------------------------------------------
 class LoginRequest(BaseModel):
+    tenant_slug: str = "aunts-lusaka"
     username: str
     password: str
 
 
 class LoginResponse(BaseModel):
     id: int
+    tenant_id: str
+    tenant_slug: str
     username: str
     role: Literal["cashier", "owner"]
+    access_token: str
+    refresh_token: str
+    token: str  # Alias for access_token
+
+
+class RefreshTokenRequest(BaseModel):
+    refresh_token: str
+
+
+class TokenPairResponse(BaseModel):
+    access_token: str
+    refresh_token: str
     token: str
+
+
+class LogoutRequest(BaseModel):
+    refresh_token: Optional[str] = None
 
 
 # ---------------------------------------------------------
@@ -69,6 +94,25 @@ class DrinkInventoryWithItemResponse(BaseModel):
     is_low_stock: bool
     model_config = ConfigDict(from_attributes=True)
 
+    @model_validator(mode="before")
+    @classmethod
+    def convert_money(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            if "price_zmw" not in data and "price_ngwee" in data:
+                return {**data, "price_zmw": ngwee_to_zmw(data["price_ngwee"])}
+            return data
+        if hasattr(data, "menu_item") and getattr(data, "menu_item", None) is not None:
+            return {
+                "id": data.id,
+                "menu_item_id": data.menu_item_id,
+                "name": data.menu_item.name,
+                "price_zmw": ngwee_to_zmw(data.menu_item.price_ngwee),
+                "stock_quantity": data.stock_quantity,
+                "low_stock_threshold": data.low_stock_threshold,
+                "is_low_stock": data.stock_quantity <= data.low_stock_threshold,
+            }
+        return data
+
 
 # ---------------------------------------------------------
 # MenuItem Schemas
@@ -84,18 +128,46 @@ class MenuItemCreate(MenuItemBase):
     initial_stock: Optional[int] = None
     low_stock_threshold: Optional[int] = 5
 
+    @property
+    def price_ngwee(self) -> int:
+        return zmw_to_ngwee(self.price_zmw)
+
 
 class MenuItemUpdate(BaseModel):
     name: Optional[str] = None
     category: Optional[Literal["meal", "drink", "extra"]] = None
-    price_zmw: Optional[float] = Field(default=None, gt=0)
+    price_zmw: Optional[Decimal] = Field(default=None, gt=0)
     is_available: Optional[bool] = None
+
+    @property
+    def price_ngwee(self) -> Optional[int]:
+        if self.price_zmw is None:
+            return None
+        return zmw_to_ngwee(self.price_zmw)
 
 
 class MenuItemResponse(MenuItemBase):
     id: int
     drink_inventory: Optional[DrinkInventoryResponse] = None
     model_config = ConfigDict(from_attributes=True)
+
+    @model_validator(mode="before")
+    @classmethod
+    def convert_money(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            if "price_zmw" not in data and "price_ngwee" in data:
+                return {**data, "price_zmw": ngwee_to_zmw(data["price_ngwee"])}
+            return data
+        if hasattr(data, "price_ngwee"):
+            return {
+                "id": data.id,
+                "name": data.name,
+                "category": data.category,
+                "price_zmw": ngwee_to_zmw(data.price_ngwee),
+                "is_available": data.is_available,
+                "drink_inventory": getattr(data, "drink_inventory", None),
+            }
+        return data
 
 
 # ---------------------------------------------------------
@@ -114,15 +186,32 @@ class OrderItemResponse(BaseModel):
     price_at_sale: float
     model_config = ConfigDict(from_attributes=True)
 
+    @model_validator(mode="before")
+    @classmethod
+    def convert_money(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            if "price_at_sale" not in data and "price_at_sale_ngwee" in data:
+                return {**data, "price_at_sale": ngwee_to_zmw(data["price_at_sale_ngwee"])}
+            return data
+        if hasattr(data, "price_at_sale_ngwee"):
+            return {
+                "id": data.id,
+                "order_id": data.order_id,
+                "menu_item_id": data.menu_item_id,
+                "quantity": data.quantity,
+                "price_at_sale": ngwee_to_zmw(data.price_at_sale_ngwee),
+            }
+        return data
+
 
 # ---------------------------------------------------------
 # Order Schemas
 # ---------------------------------------------------------
 class OrderCreate(BaseModel):
-    cashier_id: int
+    model_config = ConfigDict(extra="forbid")
+
     payment_method: Literal["cash", "mobile_money"]
     items: List[OrderItemCreate]
-    lenco_reference: Optional[str] = None
 
 
 class OrderResponse(BaseModel):
@@ -135,6 +224,26 @@ class OrderResponse(BaseModel):
     created_at: datetime
     items: List[OrderItemResponse] = []
     model_config = ConfigDict(from_attributes=True)
+
+    @model_validator(mode="before")
+    @classmethod
+    def convert_money(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            if "total_amount" not in data and "total_ngwee" in data:
+                return {**data, "total_amount": ngwee_to_zmw(data["total_ngwee"])}
+            return data
+        if hasattr(data, "total_ngwee"):
+            return {
+                "id": data.id,
+                "cashier_id": data.cashier_id,
+                "total_amount": ngwee_to_zmw(data.total_ngwee),
+                "payment_method": data.payment_method,
+                "payment_status": data.payment_status,
+                "lenco_reference": data.lenco_reference,
+                "created_at": data.created_at,
+                "items": getattr(data, "items", []),
+            }
+        return data
 
 
 # ---------------------------------------------------------
@@ -163,6 +272,13 @@ class PaymentStatusResponse(BaseModel):
     lenco_reference: Optional[str] = None
 
 
+class ReconciliationResponse(BaseModel):
+    checked_count: int
+    settled_paid_count: int
+    settled_failed_count: int
+    still_pending_count: int
+
+
 # ---------------------------------------------------------
 # Dashboard & Analytics Schemas
 # ---------------------------------------------------------
@@ -173,9 +289,38 @@ class DashboardSummaryResponse(BaseModel):
     today_orders_count: int
     low_stock_alerts: List[DrinkInventoryWithItemResponse]
 
+    @model_validator(mode="before")
+    @classmethod
+    def convert_money(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            out = dict(data)
+            if "today_total_revenue_zmw" not in out and "today_total_revenue_ngwee" in out:
+                out["today_total_revenue_zmw"] = ngwee_to_zmw(out.pop("today_total_revenue_ngwee"))
+            if "today_cash_revenue_zmw" not in out and "today_cash_revenue_ngwee" in out:
+                out["today_cash_revenue_zmw"] = ngwee_to_zmw(out.pop("today_cash_revenue_ngwee"))
+            if (
+                "settlement_account_balance_zmw" not in out
+                and "settlement_account_balance_ngwee" in out
+            ):
+                out["settlement_account_balance_zmw"] = ngwee_to_zmw(
+                    out.pop("settlement_account_balance_ngwee")
+                )
+            return out
+        return data
+
 
 class CalendarDayAnalytics(BaseModel):
     date: str  # YYYY-MM-DD
     total_revenue_zmw: float
     total_orders_count: int
     total_meals_sold: int
+
+    @model_validator(mode="before")
+    @classmethod
+    def convert_money(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            out = dict(data)
+            if "total_revenue_zmw" not in out and "total_revenue_ngwee" in out:
+                out["total_revenue_zmw"] = ngwee_to_zmw(out.pop("total_revenue_ngwee"))
+            return out
+        return data
