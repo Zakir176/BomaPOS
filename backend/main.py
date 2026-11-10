@@ -1,19 +1,39 @@
+import hashlib
+import json
+import logging
+import os
 import re
 import time
-from datetime import datetime, date
-from typing import List, Optional
-from fastapi import FastAPI, Depends, HTTPException, Header, Query, status
+import uuid
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional, Tuple
+from zoneinfo import ZoneInfo
+
+import jwt
+from dotenv import load_dotenv
+from fastapi import FastAPI, Depends, HTTPException, Header, Query, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
-from sqlalchemy import func
+from sqlalchemy import func, case, cast, Date, extract, update, text
 from passlib.context import CryptContext
 
+load_dotenv()
+
 try:
-    from .database import engine, get_db, Base
-    from .models import User, MenuItem, DrinkInventory, Order, OrderItem
+    from .database import SessionLocal, get_db, bind_session_to_tenant
+    from .lenco_client import (
+        LencoClient,
+        LencoCollectionResult,
+        get_lenco_client,
+        verify_lenco_webhook_signature,
+    )
+    from .models import Tenant, User, RefreshToken, MenuItem, DrinkInventory, Order, OrderItem
     from .schemas import (
         LoginRequest,
         LoginResponse,
+        RefreshTokenRequest,
+        TokenPairResponse,
+        LogoutRequest,
         MenuItemResponse,
         MenuItemUpdate,
         DrinkInventoryWithItemResponse,
@@ -22,19 +42,26 @@ try:
         OrderResponse,
         MobileMoneyInitiateRequest,
         MobileMoneyInitiateResponse,
-        LencoWebhookRequest,
         PaymentStatusResponse,
+        ReconciliationResponse,
         DashboardSummaryResponse,
         CalendarDayAnalytics,
     )
-
-    
 except ImportError:
-    from database import engine, get_db, Base
-    from models import User, MenuItem, DrinkInventory, Order, OrderItem
+    from database import SessionLocal, get_db, bind_session_to_tenant
+    from lenco_client import (
+        LencoClient,
+        LencoCollectionResult,
+        get_lenco_client,
+        verify_lenco_webhook_signature,
+    )
+    from models import Tenant, User, RefreshToken, MenuItem, DrinkInventory, Order, OrderItem
     from schemas import (
         LoginRequest,
         LoginResponse,
+        RefreshTokenRequest,
+        TokenPairResponse,
+        LogoutRequest,
         MenuItemResponse,
         MenuItemUpdate,
         DrinkInventoryWithItemResponse,
@@ -43,21 +70,60 @@ except ImportError:
         OrderResponse,
         MobileMoneyInitiateRequest,
         MobileMoneyInitiateResponse,
-        LencoWebhookRequest,
         PaymentStatusResponse,
+        ReconciliationResponse,
         DashboardSummaryResponse,
         CalendarDayAnalytics,
     )
 
-# Ensure tables exist
-Base.metadata.create_all(bind=engine)
+logger = logging.getLogger("bomapos")
+
+BUSINESS_TIMEZONE = "Africa/Lusaka"
+LUSAKA_TZ = ZoneInfo(BUSINESS_TIMEZONE)
+
+JWT_ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 30
+REFRESH_TOKEN_EXPIRE_DAYS = 7
+MIN_JWT_SECRET_LEN = 32
+
+
+def validate_jwt_secret(secret: Optional[str] = None) -> str:
+    val = secret if secret is not None else os.environ.get("JWT_SECRET", "")
+    if not val or len(val.strip()) < MIN_JWT_SECRET_LEN:
+        raise RuntimeError(
+            f"JWT_SECRET environment variable must be set and at least {MIN_JWT_SECRET_LEN} characters long"
+        )
+    return val
+
+
+# Fail startup immediately if JWT_SECRET is missing or too short
+JWT_SECRET = validate_jwt_secret()
+
+
+def parse_allowed_origins(raw_origins: Optional[str] = None) -> List[str]:
+    raw = (
+        raw_origins
+        if raw_origins is not None
+        else os.environ.get(
+            "ALLOWED_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173"
+        )
+    )
+    origins = [o.strip() for o in raw.split(",") if o.strip()]
+    if not origins or "*" in origins:
+        raise RuntimeError(
+            "ALLOWED_ORIGINS must be a non-empty comma-separated list of explicit origins without wildcard '*'"
+        )
+    return origins
+
+
+ALLOWED_ORIGINS = parse_allowed_origins()
 
 app = FastAPI(title="BomaPOS API", version="1.0.0")
 
-# Enable CORS for all origins
+# Restrict CORS to explicit ALLOWED_ORIGINS list (no wildcard '*')
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -65,48 +131,217 @@ app.add_middleware(
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
+# Basic in-memory login rate limiter (sliding window per client IP + username/tenant)
+LOGIN_RATE_LIMIT_MAX_ATTEMPTS = 5
+LOGIN_RATE_LIMIT_WINDOW_SECONDS = 60
+_login_attempts: Dict[str, List[float]] = {}
+
+
+def reset_login_rate_limiter() -> None:
+    _login_attempts.clear()
+
+
+def _check_login_rate_limit(key: str) -> None:
+    now = time.monotonic()
+    window_start = now - LOGIN_RATE_LIMIT_WINDOW_SECONDS
+    history = [ts for ts in _login_attempts.get(key, []) if ts > window_start]
+    if len(history) >= LOGIN_RATE_LIMIT_MAX_ATTEMPTS:
+        _login_attempts[key] = history
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many failed login attempts. Please try again later.",
+        )
+    _login_attempts[key] = history
+
+
+def _record_failed_login(key: str) -> None:
+    now = time.monotonic()
+    window_start = now - LOGIN_RATE_LIMIT_WINDOW_SECONDS
+    history = [ts for ts in _login_attempts.get(key, []) if ts > window_start]
+    history.append(now)
+    _login_attempts[key] = history
+
+
+def _clear_login_attempts(key: str) -> None:
+    _login_attempts.pop(key, None)
+
 
 # ---------------------------------------------------------
-# Auth Dependencies & Helpers
+# JWT & Refresh Token Helpers
 # ---------------------------------------------------------
-def create_local_token(user: User) -> str:
-    # Clean local token format: "user_id:role:username"
-    return f"{user.id}:{user.role}:{user.username}"
+def hash_refresh_token(raw_token: str) -> str:
+    return hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
 
 
-def get_current_user(
-    x_auth_token: Optional[str] = Header(None, alias="X-Auth-Token"),
-    db: Session = Depends(get_db),
-) -> User:
-    if not x_auth_token:
+def create_access_token(
+    user_id: int,
+    tenant_id: uuid.UUID,
+    role: str,
+    expires_delta: Optional[timedelta] = None,
+) -> str:
+    now = datetime.now(timezone.utc)
+    exp = now + (
+        expires_delta
+        if expires_delta is not None
+        else timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    )
+    payload = {
+        "sub": str(user_id),
+        "tenant_id": str(tenant_id),
+        "role": role,
+        "iat": int(now.timestamp()),
+        "exp": int(exp.timestamp()),
+        "jti": str(uuid.uuid4()),
+        "type": "access",
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+
+def create_refresh_token_jwt(
+    user_id: int,
+    tenant_id: uuid.UUID,
+    role: str,
+    expires_delta: Optional[timedelta] = None,
+) -> Tuple[str, str, datetime]:
+    now = datetime.now(timezone.utc)
+    exp = now + (
+        expires_delta
+        if expires_delta is not None
+        else timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
+    )
+    jti = str(uuid.uuid4())
+    payload = {
+        "sub": str(user_id),
+        "tenant_id": str(tenant_id),
+        "role": role,
+        "iat": int(now.timestamp()),
+        "exp": int(exp.timestamp()),
+        "jti": jti,
+        "type": "refresh",
+    }
+    encoded = jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+    return encoded, jti, exp
+
+
+def decode_and_verify_jwt(token: str, expected_type: str = "access") -> dict:
+    try:
+        header = jwt.get_unverified_header(token)
+    except jwt.PyJWTError:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Missing authentication token in X-Auth-Token header",
+            detail="Malformed authentication token",
         )
 
-    parts = x_auth_token.split(":")
-    if len(parts) != 3:
+    if header.get("alg") != JWT_ALGORITHM:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid authentication token format",
+            detail="Invalid token signing algorithm",
         )
 
     try:
-        user_id = int(parts[0])
-    except ValueError:
+        payload = jwt.decode(
+            token,
+            JWT_SECRET,
+            algorithms=[JWT_ALGORITHM],
+            options={"require": ["sub", "tenant_id", "role", "exp", "iat", "jti"]},
+        )
+    except jwt.ExpiredSignatureError:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid user ID in token",
+            detail="Token has expired",
         )
-
-    user = db.query(User).filter(User.id == user_id).first()
-    if not user or user.username != parts[2] or user.role != parts[1]:
+    except jwt.PyJWTError:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or expired session token",
+            detail="Invalid authentication token",
         )
 
-    return user
+    token_type = payload.get("type", "access")
+    if token_type != expected_type:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=f"Expected {expected_type} token",
+        )
+
+    return payload
+
+
+def _extract_bearer_token(
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+) -> str:
+    if not authorization:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing Authorization Bearer token",
+        )
+    parts = authorization.strip().split(" ", 1)
+    if len(parts) != 2 or parts[0].lower() != "bearer" or not parts[1].strip():
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid Authorization header format. Expected 'Bearer <token>'",
+        )
+    return parts[1].strip()
+
+
+# ---------------------------------------------------------
+# Request-Scoped Tenant Session & Auth Dependencies
+# ---------------------------------------------------------
+def get_tenant_db(
+    token: str = Depends(_extract_bearer_token),
+    db: Session = Depends(get_db),
+) -> Session:
+    """
+    Single request-scoped dependency that verifies the JWT, checks that both the
+    tenant and user are active, and yields a DB session bound to the verified tenant
+    with Postgres RLS configured via set_config('app.current_tenant', :id, true).
+    """
+    claims = decode_and_verify_jwt(token, expected_type="access")
+
+    try:
+        user_id = int(claims["sub"])
+        tenant_id = uuid.UUID(str(claims["tenant_id"]))
+    except (ValueError, KeyError):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token claims",
+        )
+
+    role = claims.get("role")
+    if role not in ("cashier", "owner"):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid role in token",
+        )
+
+    tenant = db.query(Tenant).filter(Tenant.id == tenant_id).first()
+    if not tenant or tenant.status != "active":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Tenant is suspended or does not exist",
+        )
+
+    bind_session_to_tenant(db, tenant.id)
+
+    user = (
+        db.query(User)
+        .filter(User.id == user_id, User.tenant_id == tenant.id)
+        .first()
+    )
+    if not user or not user.is_active or user.role != role:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="User is inactive or invalid",
+        )
+
+    db.info["current_user"] = user
+    db.info["current_tenant"] = tenant
+    return db
+
+
+def get_current_user(
+    db: Session = Depends(get_tenant_db),
+) -> User:
+    return db.info["current_user"]
 
 
 def require_owner(current_user: User = Depends(get_current_user)) -> User:
@@ -118,34 +353,228 @@ def require_owner(current_user: User = Depends(get_current_user)) -> User:
     return current_user
 
 
+def _issue_token_pair(db: Session, user: User) -> Tuple[str, str]:
+    access_token = create_access_token(
+        user_id=user.id,
+        tenant_id=user.tenant_id,
+        role=user.role,
+    )
+    refresh_token, jti, expires_at = create_refresh_token_jwt(
+        user_id=user.id,
+        tenant_id=user.tenant_id,
+        role=user.role,
+    )
+    rt_record = RefreshToken(
+        tenant_id=user.tenant_id,
+        user_id=user.id,
+        token_hash=hash_refresh_token(refresh_token),
+        jti=jti,
+        expires_at=expires_at,
+    )
+    db.add(rt_record)
+    db.commit()
+    return access_token, refresh_token
+
+
 # ---------------------------------------------------------
-# 1. Authentication Routes (FR-1.1 - FR-1.3)
+# 1. Authentication Routes (Login, Refresh Rotation, Logout)
 # ---------------------------------------------------------
 @app.post("/api/auth/login", response_model=LoginResponse)
-def login(payload: LoginRequest, db: Session = Depends(get_db)):
-    user = db.query(User).filter(User.username == payload.username).first()
-    if not user or not pwd_context.verify(payload.password, user.password_hash):
+def login(
+    payload: LoginRequest,
+    request: Request,
+    x_tenant_slug: Optional[str] = Header(None, alias="X-Tenant-Slug"),
+    db: Session = Depends(get_db),
+):
+    raw_username = payload.username.strip()
+    tenant_slug = (x_tenant_slug or payload.tenant_slug or "aunts-lusaka").strip()
+    if "/" in raw_username and not x_tenant_slug:
+        tenant_slug, raw_username = raw_username.split("/", 1)
+
+    client_ip = request.client.host if request.client else "local"
+    rate_key = f"{client_ip}:{tenant_slug}:{raw_username}"
+    _check_login_rate_limit(rate_key)
+
+    tenant = db.query(Tenant).filter(Tenant.slug == tenant_slug).first()
+    if not tenant or tenant.status != "active":
+        _record_failed_login(rate_key)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid username or password",
+            detail="Invalid tenant, username, or password",
         )
 
-    token = create_local_token(user)
+    bind_session_to_tenant(db, tenant.id)
+
+    user = (
+        db.query(User)
+        .filter(User.tenant_id == tenant.id, User.username == raw_username)
+        .first()
+    )
+    if (
+        not user
+        or not user.is_active
+        or not pwd_context.verify(payload.password, user.password_hash)
+    ):
+        _record_failed_login(rate_key)
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid tenant, username, or password",
+        )
+
+    _clear_login_attempts(rate_key)
+    access_token, refresh_token = _issue_token_pair(db, user)
+
     return LoginResponse(
         id=user.id,
+        tenant_id=str(tenant.id),
+        tenant_slug=tenant.slug,
         username=user.username,
         role=user.role,
-        token=token,
+        access_token=access_token,
+        refresh_token=refresh_token,
+        token=access_token,
     )
+
+
+@app.post("/api/auth/refresh", response_model=TokenPairResponse)
+def refresh_tokens(
+    payload: RefreshTokenRequest,
+    db: Session = Depends(get_db),
+):
+    claims = decode_and_verify_jwt(payload.refresh_token, expected_type="refresh")
+
+    try:
+        user_id = int(claims["sub"])
+        tenant_id = uuid.UUID(str(claims["tenant_id"]))
+    except (ValueError, KeyError):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid refresh token claims",
+        )
+
+    tenant = db.query(Tenant).filter(Tenant.id == tenant_id).first()
+    if not tenant or tenant.status != "active":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Tenant is suspended or does not exist",
+        )
+
+    bind_session_to_tenant(db, tenant.id)
+
+    token_hash = hash_refresh_token(payload.refresh_token)
+    stored_token = (
+        db.query(RefreshToken)
+        .filter(
+            RefreshToken.tenant_id == tenant.id,
+            RefreshToken.token_hash == token_hash,
+        )
+        .first()
+    )
+
+    now = datetime.now(timezone.utc)
+    if (
+        not stored_token
+        or stored_token.revoked_at is not None
+        or stored_token.expires_at <= now
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Refresh token has been revoked or expired",
+        )
+
+    user = (
+        db.query(User)
+        .filter(User.id == user_id, User.tenant_id == tenant.id)
+        .first()
+    )
+    if not user or not user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="User is inactive or does not exist",
+        )
+
+    # Rotate refresh token: revoke the current refresh token and issue a fresh pair
+    stored_token.revoked_at = now
+    access_token, new_refresh_token = _issue_token_pair(db, user)
+
+    return TokenPairResponse(
+        access_token=access_token,
+        refresh_token=new_refresh_token,
+        token=access_token,
+    )
+
+
+@app.post("/api/auth/logout")
+def logout(
+    payload: Optional[LogoutRequest] = None,
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+    db: Session = Depends(get_db),
+):
+    claims = None
+    if authorization:
+        raw_access = _extract_bearer_token(authorization)
+        claims = decode_and_verify_jwt(raw_access, expected_type="access")
+    elif payload and payload.refresh_token:
+        claims = decode_and_verify_jwt(payload.refresh_token, expected_type="refresh")
+    else:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing Authorization Bearer token or refresh_token",
+        )
+
+    try:
+        user_id = int(claims["sub"])
+        tenant_id = uuid.UUID(str(claims["tenant_id"]))
+    except (ValueError, KeyError):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token claims",
+        )
+
+    bind_session_to_tenant(db, tenant_id)
+    now = datetime.now(timezone.utc)
+
+    if payload and payload.refresh_token:
+        th = hash_refresh_token(payload.refresh_token)
+        rt = (
+            db.query(RefreshToken)
+            .filter(
+                RefreshToken.tenant_id == tenant_id,
+                RefreshToken.user_id == user_id,
+                RefreshToken.token_hash == th,
+            )
+            .first()
+        )
+        if rt and rt.revoked_at is None:
+            rt.revoked_at = now
+    else:
+        # Revoke all active refresh tokens for this user in this tenant
+        active_tokens = (
+            db.query(RefreshToken)
+            .filter(
+                RefreshToken.tenant_id == tenant_id,
+                RefreshToken.user_id == user_id,
+                RefreshToken.revoked_at.is_(None),
+            )
+            .all()
+        )
+        for rt in active_tokens:
+            rt.revoked_at = now
+
+    db.commit()
+    return {"status": "logged_out"}
 
 
 # ---------------------------------------------------------
 # 2. Menu Management (FR-2.1)
 # ---------------------------------------------------------
 @app.get("/api/menu", response_model=List[MenuItemResponse])
-def get_menu(db: Session = Depends(get_db)):
-    items = db.query(MenuItem).all()
-    # Populate low stock indicator if item has drink inventory
+def get_menu(
+    db: Session = Depends(get_tenant_db),
+    _: User = Depends(get_current_user),
+):
+    tenant_id = db.info["tenant_id"]
+    items = db.query(MenuItem).filter(MenuItem.tenant_id == tenant_id).all()
     for item in items:
         if item.drink_inventory:
             item.drink_inventory.is_low_stock = (
@@ -158,10 +587,15 @@ def get_menu(db: Session = Depends(get_db)):
 def update_menu_item(
     item_id: int,
     payload: MenuItemUpdate,
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_tenant_db),
     _: User = Depends(require_owner),
 ):
-    item = db.query(MenuItem).filter(MenuItem.id == item_id).first()
+    tenant_id = db.info["tenant_id"]
+    item = (
+        db.query(MenuItem)
+        .filter(MenuItem.id == item_id, MenuItem.tenant_id == tenant_id)
+        .first()
+    )
     if not item:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -172,8 +606,8 @@ def update_menu_item(
         item.name = payload.name
     if payload.category is not None:
         item.category = payload.category
-    if payload.price_zmw is not None:
-        item.price_zmw = payload.price_zmw
+    if payload.price_ngwee is not None:
+        item.price_ngwee = payload.price_ngwee
     if payload.is_available is not None:
         item.is_available = payload.is_available
 
@@ -186,32 +620,37 @@ def update_menu_item(
 # 3. Drink Inventory & Low-Stock Alerts (FR-4.1 - FR-4.3)
 # ---------------------------------------------------------
 @app.get("/api/inventory/drinks", response_model=List[DrinkInventoryWithItemResponse])
-def get_drink_inventory(db: Session = Depends(get_db)):
-    inventories = db.query(DrinkInventory).join(MenuItem).all()
-    results = []
-    for inv in inventories:
-        results.append(
-            DrinkInventoryWithItemResponse(
-                id=inv.id,
-                menu_item_id=inv.menu_item_id,
-                name=inv.menu_item.name,
-                price_zmw=inv.menu_item.price_zmw,
-                stock_quantity=inv.stock_quantity,
-                low_stock_threshold=inv.low_stock_threshold,
-                is_low_stock=(inv.stock_quantity <= inv.low_stock_threshold),
-            )
+def get_drink_inventory(
+    db: Session = Depends(get_tenant_db),
+    _: User = Depends(get_current_user),
+):
+    tenant_id = db.info["tenant_id"]
+    inventories = (
+        db.query(DrinkInventory)
+        .join(
+            MenuItem,
+            (MenuItem.id == DrinkInventory.menu_item_id)
+            & (MenuItem.tenant_id == DrinkInventory.tenant_id),
         )
-    return results
+        .filter(DrinkInventory.tenant_id == tenant_id)
+        .all()
+    )
+    return [DrinkInventoryWithItemResponse.model_validate(inv) for inv in inventories]
 
 
 @app.patch("/api/inventory/drinks/{drink_id}", response_model=DrinkInventoryWithItemResponse)
 def update_drink_inventory(
     drink_id: int,
     payload: DrinkInventoryUpdate,
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_tenant_db),
     _: User = Depends(require_owner),
 ):
-    inv = db.query(DrinkInventory).filter(DrinkInventory.id == drink_id).first()
+    tenant_id = db.info["tenant_id"]
+    inv = (
+        db.query(DrinkInventory)
+        .filter(DrinkInventory.id == drink_id, DrinkInventory.tenant_id == tenant_id)
+        .first()
+    )
     if not inv:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -226,15 +665,30 @@ def update_drink_inventory(
     db.commit()
     db.refresh(inv)
 
-    return DrinkInventoryWithItemResponse(
-        id=inv.id,
-        menu_item_id=inv.menu_item_id,
-        name=inv.menu_item.name,
-        price_zmw=inv.menu_item.price_zmw,
-        stock_quantity=inv.stock_quantity,
-        low_stock_threshold=inv.low_stock_threshold,
-        is_low_stock=(inv.stock_quantity <= inv.low_stock_threshold),
+    return DrinkInventoryWithItemResponse.model_validate(inv)
+
+
+def deduct_drink_stock_atomically(
+    db: Session, tenant_id: uuid.UUID, menu_item: MenuItem, quantity: int
+) -> None:
+    """Atomically decrement tenant-scoped drink stock using UPDATE ... WHERE stock_quantity >= qty."""
+    stmt = (
+        update(DrinkInventory)
+        .where(
+            DrinkInventory.tenant_id == tenant_id,
+            DrinkInventory.menu_item_id == menu_item.id,
+            DrinkInventory.stock_quantity >= quantity,
+        )
+        .values(stock_quantity=DrinkInventory.stock_quantity - quantity)
+        .execution_options(synchronize_session=False)
     )
+    result = db.execute(stmt)
+    if result.rowcount == 0:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Insufficient stock for {menu_item.name}. Requested: {quantity}",
+        )
 
 
 # ---------------------------------------------------------
@@ -243,30 +697,27 @@ def update_drink_inventory(
 @app.post("/api/orders", response_model=OrderResponse, status_code=status.HTTP_201_CREATED)
 def create_order(
     payload: OrderCreate,
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_tenant_db),
     current_user: User = Depends(get_current_user),
 ):
+    tenant_id = db.info["tenant_id"]
+
     if not payload.items:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Order must contain at least one item",
         )
 
-    # Verify cashier exists
-    cashier = db.query(User).filter(User.id == payload.cashier_id).first()
-    if not cashier:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Cashier with id {payload.cashier_id} does not exist",
-        )
-
-    total_amount = 0.0
+    total_ngwee = 0
     order_items_to_create = []
-    drink_inventories_to_decrement = []
+    drinks_to_decrement = []
 
-    # Process items and calculate prices strictly from DB
     for item_in in payload.items:
-        menu_item = db.query(MenuItem).filter(MenuItem.id == item_in.menu_item_id).first()
+        menu_item = (
+            db.query(MenuItem)
+            .filter(MenuItem.id == item_in.menu_item_id, MenuItem.tenant_id == tenant_id)
+            .first()
+        )
         if not menu_item:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -278,44 +729,51 @@ def create_order(
                 detail=f"MenuItem '{menu_item.name}' is currently marked unavailable",
             )
 
-        # Check stock if item is a drink
         if menu_item.category == "drink":
-            drink_inv = db.query(DrinkInventory).filter(DrinkInventory.menu_item_id == menu_item.id).first()
-            if not drink_inv or drink_inv.stock_quantity < item_in.quantity:
-                available = drink_inv.stock_quantity if drink_inv else 0
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=f"Insufficient stock for {menu_item.name}. Available: {available}, Requested: {item_in.quantity}",
-                )
-            drink_inventories_to_decrement.append((drink_inv, item_in.quantity))
+            drinks_to_decrement.append((menu_item, item_in.quantity))
 
-        item_total = menu_item.price_zmw * item_in.quantity
-        total_amount += item_total
+        item_total_ngwee = menu_item.price_ngwee * item_in.quantity
+        total_ngwee += item_total_ngwee
 
         order_items_to_create.append(
             OrderItem(
+                tenant_id=tenant_id,
                 menu_item_id=menu_item.id,
                 quantity=item_in.quantity,
-                price_at_sale=menu_item.price_zmw,
+                price_at_sale_ngwee=menu_item.price_ngwee,
             )
         )
 
-    # Payment logic
     if payload.payment_method == "cash":
         payment_status = "paid"
-        # Immediate stock deduction for cash payments
-        for drink_inv, qty in drink_inventories_to_decrement:
-            drink_inv.stock_quantity -= qty
+        for drink_item, qty in drinks_to_decrement:
+            deduct_drink_stock_atomically(db, tenant_id, drink_item, qty)
     else:  # mobile_money
         payment_status = "pending"
-        # Stock will be deducted once mobile money payment confirms in webhook module
+        for drink_item, qty in drinks_to_decrement:
+            has_stock = (
+                db.query(DrinkInventory.id)
+                .filter(
+                    DrinkInventory.tenant_id == tenant_id,
+                    DrinkInventory.menu_item_id == drink_item.id,
+                    DrinkInventory.stock_quantity >= qty,
+                )
+                .first()
+            )
+            if not has_stock:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Insufficient stock for {drink_item.name}. Requested: {qty}",
+                )
 
+    # Always use the authenticated user (current_user.id) as the cashier
     new_order = Order(
-        cashier_id=payload.cashier_id,
-        total_amount=round(total_amount, 2),
+        tenant_id=tenant_id,
+        cashier_id=current_user.id,
+        total_ngwee=total_ngwee,
         payment_method=payload.payment_method,
         payment_status=payment_status,
-        lenco_reference=payload.lenco_reference,
+        lenco_reference=None,
     )
     new_order.items = order_items_to_create
 
@@ -327,7 +785,7 @@ def create_order(
 
 
 # ---------------------------------------------------------
-# 5. Mock Lenco Mobile Money Integration (FR-3.1 - FR-3.4)
+# 5. Lenco Mobile Money Integration, Webhook & Reconciliation
 # ---------------------------------------------------------
 def normalize_zambian_phone(phone: str) -> str:
     cleaned = re.sub(r"[\s\-\(\)]", "", phone.strip())
@@ -336,23 +794,79 @@ def normalize_zambian_phone(phone: str) -> str:
     elif cleaned.startswith("0"):
         cleaned = "260" + cleaned[1:]
 
-    # Must be 12 digits starting with 260 and followed by 97, 96, 95, 77, 76, 75
     pattern = r"^260(97|96|95|77|76|75)\d{7}$"
     if not re.match(pattern, cleaned):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Invalid Zambian phone number: '{phone}'. Expected 097/096/095/077/076/075 series or 260...",
+            detail="Invalid Zambian phone number format. Expected 097/096/095/077/076/075 series or 260...",
         )
     return cleaned
+
+
+def settle_order_with_collection(
+    db: Session,
+    tenant_id: uuid.UUID,
+    order: Order,
+    collection: Optional[LencoCollectionResult],
+    expected_status: Optional[str] = None,
+) -> str:
+    """
+    Settle an order using verified provider collection data.
+    Shared by both the webhook handler and the stuck-order reconciliation job/endpoint.
+    """
+    if order.payment_status == "paid":
+        return "already_paid"
+
+    if collection is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Collection not found at payment provider",
+        )
+
+    if expected_status and collection.status != expected_status:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Collection status '{collection.status}' does not match event '{expected_status}'",
+        )
+
+    if collection.currency.upper() != "ZMW" or collection.amount_ngwee != order.total_ngwee:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Collection amount or currency does not match order",
+        )
+
+    if collection.status == "successful":
+        for item in order.items:
+            if item.menu_item and item.menu_item.category == "drink":
+                deduct_drink_stock_atomically(
+                    db, tenant_id, item.menu_item, item.quantity
+                )
+        order.payment_status = "paid"
+        db.commit()
+        return "paid"
+
+    if collection.status == "failed":
+        if order.payment_status != "paid":
+            order.payment_status = "failed"
+            db.commit()
+        return "failed"
+
+    return "pending"
 
 
 @app.post("/api/payments/mobile-money/initiate", response_model=MobileMoneyInitiateResponse)
 def initiate_mobile_money_payment(
     payload: MobileMoneyInitiateRequest,
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_tenant_db),
     _: User = Depends(get_current_user),
+    lenco_client: LencoClient = Depends(get_lenco_client),
 ):
-    order = db.query(Order).filter(Order.id == payload.order_id).first()
+    tenant_id = db.info["tenant_id"]
+    order = (
+        db.query(Order)
+        .filter(Order.id == payload.order_id, Order.tenant_id == tenant_id)
+        .first()
+    )
     if not order:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -365,66 +879,235 @@ def initiate_mobile_money_payment(
             detail=f"Order is not in pending status (current status: '{order.payment_status}')",
         )
 
-    # Normalize phone
-    normalize_zambian_phone(payload.phone)
+    normalized_phone = normalize_zambian_phone(payload.phone)
 
-    # Generate unique Lenco reference: BOMA-{order_id}-{unix_timestamp}
-    timestamp = int(time.time())
-    lenco_ref = f"BOMA-{order.id}-{timestamp}"
+    # Generate unguessable uuid4-based payment reference
+    lenco_ref = str(uuid.uuid4())
     order.lenco_reference = lenco_ref
+
+    collection = lenco_client.collect_mobile_money(
+        reference=lenco_ref,
+        phone=normalized_phone,
+        operator=payload.operator,
+        amount_ngwee=order.total_ngwee,
+        currency="ZMW",
+    )
     db.commit()
 
     return MobileMoneyInitiateResponse(
-        status="pending",
-        message="USSD push prompt simulated to customer phone",
+        status=collection.status,
+        message=collection.message or "Mobile money prompt initiated",
         lenco_reference=lenco_ref,
     )
 
 
 @app.post("/api/webhooks/lenco")
-def lenco_webhook(
-    payload: LencoWebhookRequest,
+async def lenco_webhook(
+    request: Request,
+    x_lenco_signature: Optional[str] = Header(None, alias="X-Lenco-Signature"),
     db: Session = Depends(get_db),
+    lenco_client: LencoClient = Depends(get_lenco_client),
 ):
-    order = db.query(Order).filter(Order.lenco_reference == payload.lenco_reference).first()
-    if not order:
+    # 1. Read raw request body bytes BEFORE any JSON parsing
+    raw_body = await request.body()
+
+    # 2. Verify HMAC-SHA512 signature keyed with sha256(LENCO_API_TOKEN).hexdigest()
+    if not verify_lenco_webhook_signature(raw_body, x_lenco_signature):
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Order with lenco_reference '{payload.lenco_reference}' not found",
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing or invalid X-Lenco-Signature",
         )
 
-    if payload.status == "successful":
-        # IDEMPOTENCY: only process if not already marked paid
-        if order.payment_status != "paid":
-            order.payment_status = "paid"
+    # 3. Parse JSON event only after signature verification
+    try:
+        payload: Dict[str, Any] = json.loads(raw_body.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Malformed JSON webhook payload",
+        )
 
-            # Deduct ordered drink quantities from DrinkInventory
-            for item in order.items:
-                if item.menu_item and item.menu_item.category == "drink":
-                    drink_inv = (
-                        db.query(DrinkInventory)
-                        .filter(DrinkInventory.menu_item_id == item.menu_item_id)
-                        .first()
-                    )
-                    if drink_inv:
-                        drink_inv.stock_quantity = max(0, drink_inv.stock_quantity - item.quantity)
+    event = payload.get("event")
+    if event not in ("collection.successful", "collection.failed"):
+        return {"status": "ignored", "event": event}
 
-            db.commit()
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    reference = data.get("reference") or payload.get("reference") or payload.get("lenco_reference")
+    if not reference or not isinstance(reference, str):
+        logger.warning("Lenco webhook missing reference for event=%s", event)
+        return {"status": "ignored", "reason": "missing_reference"}
+
+    # 4. Resolve tenant_id via narrow SECURITY DEFINER lookup (returns only UUID tenant_id)
+    tenant_id = db.execute(
+        text("SELECT resolve_tenant_for_lenco_ref(:ref)"),
+        {"ref": reference},
+    ).scalar()
+    if not tenant_id:
+        logger.warning("Lenco webhook received for unknown reference=%s", reference)
+        return {"status": "ignored", "reason": "unknown_reference"}
+
+    # Set app.current_tenant and continue under normal RLS (bomapos_app has NOBYPASSRLS)
+    bind_session_to_tenant(db, tenant_id)
+
+    order = (
+        db.query(Order)
+        .filter(
+            Order.lenco_reference == reference,
+            Order.tenant_id == tenant_id,
+        )
+        .with_for_update()
+        .first()
+    )
+    if not order:
+        logger.warning("Lenco webhook order not found under tenant for reference=%s", reference)
+        return {"status": "ignored", "reason": "unknown_reference"}
+
+    expected_status = "successful" if event == "collection.successful" else "failed"
+
+    # Idempotency check: replays are a no-op
+    if order.payment_status == "paid":
+        return {"status": "noop", "message": "Order already marked paid"}
+    if order.payment_status == "failed" and expected_status == "failed":
+        return {"status": "noop", "message": "Order already marked failed"}
+
+    # 5. Re-fetch collection from Lenco and verify status, amount, and currency match the order
+    collection = lenco_client.get_collection_by_reference(reference)
+    outcome = settle_order_with_collection(
+        db=db,
+        tenant_id=tenant_id,
+        order=order,
+        collection=collection,
+        expected_status=expected_status,
+    )
+
+    if outcome == "paid":
         return {"status": "success", "message": "Payment confirmed and drink stock updated"}
-
-    elif payload.status == "failed":
-        if order.payment_status != "paid":
-            order.payment_status = "failed"
-            db.commit()
+    if outcome == "failed":
         return {"status": "failed", "message": "Order marked as payment failed"}
+    return {"status": outcome, "message": "No state transition required"}
+
+
+def reconcile_tenant_pending_orders(
+    db: Session,
+    tenant_id: uuid.UUID,
+    lenco_client: LencoClient,
+    older_than_minutes: int = 10,
+) -> ReconciliationResponse:
+    """
+    Find orders in `tenant_id` stuck in pending payment for more than `older_than_minutes`,
+    query Lenco by reference, and settle them using the same verification & stock-deduction path as webhooks.
+    """
+    bind_session_to_tenant(db, tenant_id)
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=older_than_minutes)
+
+    stuck_orders = (
+        db.query(Order)
+        .filter(
+            Order.tenant_id == tenant_id,
+            Order.payment_method == "mobile_money",
+            Order.payment_status == "pending",
+            Order.lenco_reference.isnot(None),
+            Order.created_at <= cutoff,
+        )
+        .with_for_update()
+        .all()
+    )
+
+    checked = 0
+    paid_count = 0
+    failed_count = 0
+    pending_count = 0
+
+    for order in stuck_orders:
+        checked += 1
+        collection = lenco_client.get_collection_by_reference(order.lenco_reference)
+        if collection is None or collection.status == "pending":
+            pending_count += 1
+            continue
+
+        try:
+            outcome = settle_order_with_collection(
+                db=db,
+                tenant_id=tenant_id,
+                order=order,
+                collection=collection,
+            )
+            if outcome == "paid":
+                paid_count += 1
+            elif outcome == "failed":
+                failed_count += 1
+            else:
+                pending_count += 1
+        except HTTPException as exc:
+            logger.warning(
+                "Reconciliation skipped order_id=%s ref=%s due to verification mismatch: %s",
+                order.id,
+                order.lenco_reference,
+                exc.detail,
+            )
+            pending_count += 1
+
+    return ReconciliationResponse(
+        checked_count=checked,
+        settled_paid_count=paid_count,
+        settled_failed_count=failed_count,
+        still_pending_count=pending_count,
+    )
+
+
+def reconcile_all_tenants_stuck_orders(
+    older_than_minutes: int = 10,
+    lenco_client: Optional[LencoClient] = None,
+) -> Dict[str, ReconciliationResponse]:
+    """Background/cron job entry point to reconcile stuck mobile money orders across all active tenants under RLS."""
+    client_impl = lenco_client or get_lenco_client()
+    results: Dict[str, ReconciliationResponse] = {}
+    db = SessionLocal()
+    try:
+        active_tenants = db.query(Tenant).filter(Tenant.status == "active").all()
+        for tenant in active_tenants:
+            results[tenant.slug] = reconcile_tenant_pending_orders(
+                db=db,
+                tenant_id=tenant.id,
+                lenco_client=client_impl,
+                older_than_minutes=older_than_minutes,
+            )
+        return results
+    finally:
+        db.close()
+
+
+@app.post("/api/payments/reconcile", response_model=ReconciliationResponse)
+def reconcile_pending_payments(
+    older_than_minutes: int = Query(10, ge=1),
+    db: Session = Depends(get_tenant_db),
+    _: User = Depends(require_owner),
+    lenco_client: LencoClient = Depends(get_lenco_client),
+):
+    tenant_id = db.info["tenant_id"]
+    return reconcile_tenant_pending_orders(
+        db=db,
+        tenant_id=tenant_id,
+        lenco_client=lenco_client,
+        older_than_minutes=older_than_minutes,
+    )
 
 
 @app.get("/api/payments/status/{lenco_reference}", response_model=PaymentStatusResponse)
 def get_payment_status(
     lenco_reference: str,
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_tenant_db),
+    _: User = Depends(get_current_user),
 ):
-    order = db.query(Order).filter(Order.lenco_reference == lenco_reference).first()
+    tenant_id = db.info["tenant_id"]
+    order = (
+        db.query(Order)
+        .filter(
+            Order.lenco_reference == lenco_reference,
+            Order.tenant_id == tenant_id,
+        )
+        .first()
+    )
     if not order:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -443,62 +1126,69 @@ def get_payment_status(
 # ---------------------------------------------------------
 @app.get("/api/dashboard/summary", response_model=DashboardSummaryResponse)
 def get_dashboard_summary(
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_tenant_db),
     _: User = Depends(require_owner),
 ):
-    today = date.today()
+    tenant_id = db.info["tenant_id"]
+    today_lusaka = datetime.now(LUSAKA_TZ).date()
+    lusaka_order_date = cast(func.timezone(BUSINESS_TIMEZONE, Order.created_at), Date)
 
-    # Query all paid orders created today
-    paid_orders_today = (
-        db.query(Order)
-        .filter(
-            Order.payment_status == "paid",
-            func.date(Order.created_at) == today.strftime("%Y-%m-%d"),
+    today_row = (
+        db.query(
+            func.coalesce(func.sum(Order.total_ngwee), 0).label("total_ngwee"),
+            func.coalesce(
+                func.sum(
+                    case(
+                        (Order.payment_method == "cash", Order.total_ngwee),
+                        else_=0,
+                    )
+                ),
+                0,
+            ).label("cash_ngwee"),
+            func.count(Order.id).label("orders_count"),
         )
-        .all()
+        .filter(
+            Order.tenant_id == tenant_id,
+            Order.payment_status == "paid",
+            lusaka_order_date == today_lusaka,
+        )
+        .one()
     )
 
-    today_total_revenue = sum(o.total_amount for o in paid_orders_today)
-    today_cash_revenue = sum(o.total_amount for o in paid_orders_today if o.payment_method == "cash")
-    today_orders_count = len(paid_orders_today)
-
-    # Settlement account balance = all-time total of paid mobile_money orders in sub-account
-    paid_momo_orders = (
-        db.query(Order)
+    settlement_ngwee = (
+        db.query(func.coalesce(func.sum(Order.total_ngwee), 0))
         .filter(
+            Order.tenant_id == tenant_id,
             Order.payment_status == "paid",
             Order.payment_method == "mobile_money",
         )
-        .all()
+        .scalar()
+        or 0
     )
-    settlement_account_balance = sum(o.total_amount for o in paid_momo_orders)
 
-    # Low stock alerts: drinks where stock_quantity <= low_stock_threshold
     low_stock_records = (
         db.query(DrinkInventory)
-        .join(MenuItem)
-        .filter(DrinkInventory.stock_quantity <= DrinkInventory.low_stock_threshold)
+        .join(
+            MenuItem,
+            (MenuItem.id == DrinkInventory.menu_item_id)
+            & (MenuItem.tenant_id == DrinkInventory.tenant_id),
+        )
+        .filter(
+            DrinkInventory.tenant_id == tenant_id,
+            DrinkInventory.stock_quantity <= DrinkInventory.low_stock_threshold,
+        )
         .all()
     )
 
     low_stock_alerts = [
-        DrinkInventoryWithItemResponse(
-            id=inv.id,
-            menu_item_id=inv.menu_item_id,
-            name=inv.menu_item.name,
-            price_zmw=inv.menu_item.price_zmw,
-            stock_quantity=inv.stock_quantity,
-            low_stock_threshold=inv.low_stock_threshold,
-            is_low_stock=True,
-        )
-        for inv in low_stock_records
+        DrinkInventoryWithItemResponse.model_validate(inv) for inv in low_stock_records
     ]
 
     return DashboardSummaryResponse(
-        today_total_revenue_zmw=round(today_total_revenue, 2),
-        today_cash_revenue_zmw=round(today_cash_revenue, 2),
-        settlement_account_balance_zmw=round(settlement_account_balance, 2),
-        today_orders_count=today_orders_count,
+        today_total_revenue_ngwee=int(today_row.total_ngwee),
+        today_cash_revenue_ngwee=int(today_row.cash_ngwee),
+        settlement_account_balance_ngwee=int(settlement_ngwee),
+        today_orders_count=int(today_row.orders_count),
         low_stock_alerts=low_stock_alerts,
     )
 
@@ -507,47 +1197,67 @@ def get_dashboard_summary(
 def get_dashboard_calendar(
     month: Optional[int] = Query(None, ge=1, le=12),
     year: Optional[int] = Query(None, ge=2020, le=2099),
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_tenant_db),
     _: User = Depends(require_owner),
 ):
-    query = db.query(Order).filter(Order.payment_status == "paid")
+    tenant_id = db.info["tenant_id"]
+    lusaka_ts = func.timezone(BUSINESS_TIMEZONE, Order.created_at)
+    lusaka_day = cast(lusaka_ts, Date)
 
-    paid_orders = query.all()
-
-    # Filter by month/year if supplied
-    daily_groups = {}
-    for o in paid_orders:
-        order_date = o.created_at.date()
-        if year and order_date.year != year:
-            continue
-        if month and order_date.month != month:
-            continue
-
-        date_str = order_date.strftime("%Y-%m-%d")
-        if date_str not in daily_groups:
-            daily_groups[date_str] = {
-                "date": date_str,
-                "total_revenue_zmw": 0.0,
-                "total_orders_count": 0,
-                "total_meals_sold": 0,
-            }
-
-        daily_groups[date_str]["total_revenue_zmw"] += o.total_amount
-        daily_groups[date_str]["total_orders_count"] += 1
-
-        for item in o.items:
-            if item.menu_item and item.menu_item.category == "meal":
-                daily_groups[date_str]["total_meals_sold"] += item.quantity
-
-    # Sort results by date ascending
-    results = [
-        CalendarDayAnalytics(
-            date=day_data["date"],
-            total_revenue_zmw=round(day_data["total_revenue_zmw"], 2),
-            total_orders_count=day_data["total_orders_count"],
-            total_meals_sold=day_data["total_meals_sold"],
-        )
-        for _, day_data in sorted(daily_groups.items(), key=lambda x: x[0])
+    filters = [
+        Order.tenant_id == tenant_id,
+        Order.payment_status == "paid",
     ]
+    if year is not None:
+        filters.append(extract("year", lusaka_ts) == year)
+    if month is not None:
+        filters.append(extract("month", lusaka_ts) == month)
 
-    return results
+    meals_subq = (
+        db.query(
+            OrderItem.order_id.label("order_id"),
+            func.coalesce(
+                func.sum(
+                    case(
+                        (MenuItem.category == "meal", OrderItem.quantity),
+                        else_=0,
+                    )
+                ),
+                0,
+            ).label("meals_sold"),
+        )
+        .join(
+            MenuItem,
+            (MenuItem.id == OrderItem.menu_item_id)
+            & (MenuItem.tenant_id == OrderItem.tenant_id),
+        )
+        .filter(OrderItem.tenant_id == tenant_id)
+        .group_by(OrderItem.order_id)
+        .subquery()
+    )
+
+    rows = (
+        db.query(
+            lusaka_day.label("day"),
+            func.coalesce(func.sum(Order.total_ngwee), 0).label("total_revenue_ngwee"),
+            func.count(Order.id).label("total_orders_count"),
+            func.coalesce(func.sum(func.coalesce(meals_subq.c.meals_sold, 0)), 0).label(
+                "total_meals_sold"
+            ),
+        )
+        .outerjoin(meals_subq, meals_subq.c.order_id == Order.id)
+        .filter(*filters)
+        .group_by(lusaka_day)
+        .order_by(lusaka_day.asc())
+        .all()
+    )
+
+    return [
+        CalendarDayAnalytics(
+            date=row.day.strftime("%Y-%m-%d"),
+            total_revenue_ngwee=int(row.total_revenue_ngwee),
+            total_orders_count=int(row.total_orders_count),
+            total_meals_sold=int(row.total_meals_sold),
+        )
+        for row in rows
+    ]
