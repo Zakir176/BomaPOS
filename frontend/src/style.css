@@ -1,0 +1,243 @@
+:root {
+  /* ======================================================== */
+  /* PandaStays Refined Bento Palette Specification           */
+  /* ======================================================== */
+  --color-primary: #144D2F;                 /* Deep Forest Emerald */
+  --color-primary-hover: #0F3D24;
+  --color-primary-accent: #34A864;          /* Electric Mint Accent */
+  --color-primary-container: #E6F3EB;       /* Soft Mint Container */
+  --color-on-primary: #FFFFFF;
+  --color-on-primary-container: #082515;
+
+  --color-hero-dark: #0B2416;               /* Inverted Hero Card Background */
+  --color-hero-topo: #183C28;
+
+  --color-secondary: #4A5160;               /* Warm Charcoal Navy */
+  --color-secondary-container: #EAECEF;
+  --color-on-secondary: #FFFFFF;
+  --color-on-secondary-container: #22262E;
+
+  --color-tertiary: #B47818;                /* Warm Ochre (Partial/Pending) */
+  --color-tertiary-container: #FDF4E6;
+  --color-tertiary-accent: #D99528;
+  --color-on-tertiary: #FFFFFF;
+  --color-on-tertiary-container: #492E08;
+
+  --color-error: #C43242;                   /* Brick Red (Overdue/Urgent/Stock-out) */
+  --color-error-container: #FDECEE;
+  --color-on-error: #FFFFFF;
+  --color-on-error-container: #4E1810;
+
+  /* Clean Organic Bento Surface Tokens */
+  --color-background: #F4F6F4;              /* Soft Warm Canvas */
+  --color-surface: #FFFFFF;                 /* Clean White Card Surface */
+  --color-surface-dim: #EDF1ED;
+  --color-surface-container: #F4F6F4;
+  --color-surface-container-low: #F8FAF8;
+  --color-surface-container-high: #E6ECE6;
+  --color-border-card: #E2E7E2;             /* Subtle Bento Outline */
+  --color-outline: #D0D8D0;
+
+  --color-on-surface: #0C1A12;              /* Near-Black Text */
+  --color-on-surface-variant: #5C6A61;      /* Secondary Label Text */
+  --color-on-surface-muted: #9AA79F;        /* Data Table Caps Text */
+
+  /* Carrier Brand Accents */
+  --color-mtn: #FFCC00;
+  --color-airtel: #E11900;
+  --color-zamtel: #008752;
+
+  /* Typography */
+  --font-body: 'IBM Plex Sans', -apple-system, BlinkMacSystemFont, sans-serif;
+  --font-data-mono: 'JetBrains Mono', monospace;
+
+  /* Elevation */
+  --shadow-bento: 0 2px 10px rgba(12, 26, 18, 0.04);
+  --shadow-bento-hover: 0 8px 24px rgba(12, 26, 18, 0.08);
+  --shadow-hero: 0 12px 32px rgba(11, 36, 22, 0.35);
+
+  /* Geometry */
+  --radius-bento: 1rem;       /* 16px */
+  --radius-pill: 9999px;
+  --radius-subtle: 8px;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+  -webkit-tap-highlight-color: transparent;
+}
+
+body {
+  font-family: var(--font-body);
+  background-color: var(--color-background);
+  color: var(--color-on-surface);
+  line-height: 1.5;
+  user-select: none;
+  overflow: hidden;
+  height: 100vh;
+  width: 100vw;
+  -webkit-font-smoothing: antialiased;
+}
+
+.font-data-mono {
+  font-family: var(--font-data-mono);
+  font-feature-settings: 'tnum' on, 'lnum' on;
+}
+
+/* ======================================================== */
+/* Bento Card Standard & Hero Inversion Classes             */
+/* ======================================================== */
+.card-bento {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border-card);
+  border-radius: var(--radius-bento);
+  box-shadow: var(--shadow-bento);
+  transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.card-bento:hover {
+  border-color: #D1D9D2;
+  box-shadow: var(--shadow-bento-hover);
+}
+
+.card-bento-hero {
+  background-color: var(--color-hero-dark);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: var(--radius-bento);
+  box-shadow: var(--shadow-hero);
+  color: #FFFFFF;
+  position: relative;
+  overflow: hidden;
+}
+
+/* Tactile Architectural Textures */
+.bg-hatch-diagonal {
+  background-image: repeating-linear-gradient(
+    45deg,
+    rgba(20, 77, 47, 0.04),
+    rgba(20, 77, 47, 0.04) 6px,
+    transparent 6px,
+    transparent 12px
+  );
+}
+
+.bg-topo-dark {
+  background-image: radial-gradient(
+    circle at 85% 15%,
+    rgba(52, 168, 100, 0.15) 0%,
+    rgba(24, 60, 40, 0.4) 40%,
+    transparent 70%
+  );
+}
+
+/* Capsule Pill Geometry */
+.btn-pill-primary {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  border-radius: var(--radius-pill);
+  background-color: var(--color-primary);
+  color: var(--color-on-primary);
+  font-weight: 600;
+  font-size: 14px;
+  padding: 10px 20px;
+  border: none;
+  cursor: pointer;
+  transition: all 0.15s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.btn-pill-primary:hover:not(:disabled) {
+  background-color: var(--color-primary-hover);
+  box-shadow: 0 4px 12px rgba(20, 77, 47, 0.25);
+}
+
+.btn-pill-outline {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  border-radius: var(--radius-pill);
+  background-color: var(--color-surface);
+  border: 1px solid var(--color-border-card);
+  color: var(--color-on-surface);
+  font-weight: 600;
+  font-size: 13px;
+  padding: 8px 16px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.btn-pill-outline:hover:not(:disabled) {
+  background-color: var(--color-surface-dim);
+  border-color: var(--color-outline);
+}
+
+.badge-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border-radius: var(--radius-pill);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+
+.badge-pill-mint {
+  background-color: var(--color-primary-container);
+  color: var(--color-on-primary-container);
+  border: 1px solid rgba(52, 168, 100, 0.3);
+}
+
+.badge-pill-ochre {
+  background-color: var(--color-tertiary-container);
+  color: var(--color-on-tertiary-container);
+  border: 1px solid rgba(180, 120, 24, 0.3);
+}
+
+.badge-pill-red {
+  background-color: var(--color-error-container);
+  color: var(--color-on-error-container);
+  border: 1px solid rgba(196, 50, 66, 0.3);
+}
+
+.badge-pill-charcoal {
+  background-color: var(--color-secondary-container);
+  color: var(--color-on-secondary-container);
+  border: 1px solid rgba(74, 81, 96, 0.2);
+}
+
+/* Bento Motion */
+@keyframes bentoFadeUp {
+  0% {
+    opacity: 0;
+    transform: translateY(16px) scale(0.985);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+.animate-bento-in {
+  animation: bentoFadeUp 0.45s cubic-bezier(0.16, 1, 0.3, 1) backwards;
+}
+
+/* Scrollbars */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--color-outline);
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--color-secondary);
+}
