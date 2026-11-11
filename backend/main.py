@@ -1,4 +1,5 @@
 import hashlib
+import hmac
 import json
 import logging
 import os
@@ -22,12 +23,22 @@ load_dotenv()
 try:
     from .database import SessionLocal, get_db, bind_session_to_tenant
     from .lenco_client import (
+        ACTIVE_ATTEMPT_STATUSES,
         LencoClient,
         LencoCollectionResult,
         get_lenco_client,
         verify_lenco_webhook_signature,
     )
-    from .models import Tenant, User, RefreshToken, MenuItem, DrinkInventory, Order, OrderItem
+    from .models import (
+        Tenant,
+        User,
+        RefreshToken,
+        MenuItem,
+        DrinkInventory,
+        Order,
+        OrderItem,
+        PaymentAttempt,
+    )
     from .schemas import (
         LoginRequest,
         LoginResponse,
@@ -41,6 +52,7 @@ try:
         OrderCreate,
         OrderResponse,
         MobileMoneyInitiateRequest,
+        MobileMoneySubmitOtpRequest,
         MobileMoneyInitiateResponse,
         PaymentStatusResponse,
         ReconciliationResponse,
@@ -50,12 +62,22 @@ try:
 except ImportError:
     from database import SessionLocal, get_db, bind_session_to_tenant
     from lenco_client import (
+        ACTIVE_ATTEMPT_STATUSES,
         LencoClient,
         LencoCollectionResult,
         get_lenco_client,
         verify_lenco_webhook_signature,
     )
-    from models import Tenant, User, RefreshToken, MenuItem, DrinkInventory, Order, OrderItem
+    from models import (
+        Tenant,
+        User,
+        RefreshToken,
+        MenuItem,
+        DrinkInventory,
+        Order,
+        OrderItem,
+        PaymentAttempt,
+    )
     from schemas import (
         LoginRequest,
         LoginResponse,
@@ -69,6 +91,7 @@ except ImportError:
         OrderCreate,
         OrderResponse,
         MobileMoneyInitiateRequest,
+        MobileMoneySubmitOtpRequest,
         MobileMoneyInitiateResponse,
         PaymentStatusResponse,
         ReconciliationResponse,
@@ -98,6 +121,35 @@ def validate_jwt_secret(secret: Optional[str] = None) -> str:
 
 # Fail startup immediately if JWT_SECRET is missing or too short
 JWT_SECRET = validate_jwt_secret()
+
+
+def get_cron_secret() -> str:
+    return os.environ.get("CRON_SECRET", "").strip()
+
+
+def validate_cron_secret(
+    lenco_mode: Optional[str] = None,
+    cron_secret: Optional[str] = None,
+) -> Optional[str]:
+    mode = (
+        lenco_mode
+        if lenco_mode is not None
+        else os.environ.get("LENCO_MODE", "mock")
+    ).strip().lower()
+    secret = (
+        cron_secret
+        if cron_secret is not None
+        else get_cron_secret()
+    ).strip()
+    if mode == "live" and not secret:
+        raise RuntimeError(
+            "CRON_SECRET environment variable must be set when LENCO_MODE=live"
+        )
+    return secret
+
+
+# Fail startup if CRON_SECRET is missing in live mode
+validate_cron_secret()
 
 
 def parse_allowed_origins(raw_origins: Optional[str] = None) -> List[str]:
@@ -684,11 +736,57 @@ def deduct_drink_stock_atomically(
     )
     result = db.execute(stmt)
     if result.rowcount == 0:
-        db.rollback()
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Insufficient stock for {menu_item.name}. Requested: {quantity}",
         )
+
+
+def deduct_drink_stock_clamped_for_settlement(
+    db: Session, tenant_id: uuid.UUID, menu_item: MenuItem, quantity: int
+) -> Optional[str]:
+    """
+    Decrement drink stock for a verified successful payment settlement without ever failing.
+    If stock is sufficient, decrements atomically and returns None.
+    If stock is insufficient, clamps stock_quantity at 0 and returns a short shortfall reason.
+    """
+    stmt = (
+        update(DrinkInventory)
+        .where(
+            DrinkInventory.tenant_id == tenant_id,
+            DrinkInventory.menu_item_id == menu_item.id,
+            DrinkInventory.stock_quantity >= quantity,
+        )
+        .values(stock_quantity=DrinkInventory.stock_quantity - quantity)
+        .execution_options(synchronize_session=False)
+    )
+    result = db.execute(stmt)
+    if result.rowcount > 0:
+        return None
+
+    inv = (
+        db.query(DrinkInventory)
+        .filter(
+            DrinkInventory.tenant_id == tenant_id,
+            DrinkInventory.menu_item_id == menu_item.id,
+        )
+        .with_for_update()
+        .first()
+    )
+    available = inv.stock_quantity if inv is not None else 0
+    clamp_stmt = (
+        update(DrinkInventory)
+        .where(
+            DrinkInventory.tenant_id == tenant_id,
+            DrinkInventory.menu_item_id == menu_item.id,
+        )
+        .values(
+            stock_quantity=func.greatest(DrinkInventory.stock_quantity - quantity, 0)
+        )
+        .execution_options(synchronize_session=False)
+    )
+    db.execute(clamp_stmt)
+    return f"Stock shortfall on {menu_item.name} (needed {quantity}, had {available})"
 
 
 # ---------------------------------------------------------
@@ -803,20 +901,41 @@ def normalize_zambian_phone(phone: str) -> str:
     return cleaned
 
 
+PAYMENT_ATTEMPT_EXPIRY_MINUTES = 30
+RECONCILE_BATCH_SIZE = 50
+
+
+def _update_attempt_from_collection(
+    attempt: PaymentAttempt,
+    collection: LencoCollectionResult,
+) -> None:
+    """Record status, lenco_reference, fee, bearer, and settlementStatus from Lenco responses on the attempt."""
+    attempt.status = collection.status
+    if collection.lenco_reference is not None:
+        attempt.lenco_reference = collection.lenco_reference
+    if collection.fee_ngwee is not None:
+        attempt.fee_ngwee = collection.fee_ngwee
+    if collection.fee_bearer is not None:
+        attempt.fee_bearer = collection.fee_bearer
+    if collection.settlement_status is not None:
+        attempt.settlement_status = collection.settlement_status
+    attempt.updated_at = datetime.now(timezone.utc)
+
+
 def settle_order_with_collection(
     db: Session,
     tenant_id: uuid.UUID,
     order: Order,
     collection: Optional[LencoCollectionResult],
     expected_status: Optional[str] = None,
+    attempt: Optional[PaymentAttempt] = None,
 ) -> str:
     """
     Settle an order using verified provider collection data.
-    Shared by both the webhook handler and the stuck-order reconciliation job/endpoint.
+    Shared by the webhook handler, OTP submission, and the stuck-order reconciliation job/endpoint.
+    Settlement never fails due to stock shortfall: drink stock is clamped at zero and orders.needs_review
+    is flagged with a short reason if any shortfall occurred.
     """
-    if order.payment_status == "paid":
-        return "already_paid"
-
     if collection is None:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -835,23 +954,52 @@ def settle_order_with_collection(
             detail="Collection amount or currency does not match order",
         )
 
+    if attempt is not None:
+        _update_attempt_from_collection(attempt, collection)
+
+    if order.payment_status == "paid":
+        if attempt is not None:
+            db.commit()
+        return "already_paid"
+
     if collection.status == "successful":
+        shortfall_reasons: List[str] = []
         for item in order.items:
             if item.menu_item and item.menu_item.category == "drink":
-                deduct_drink_stock_atomically(
+                reason = deduct_drink_stock_clamped_for_settlement(
                     db, tenant_id, item.menu_item, item.quantity
                 )
+                if reason:
+                    shortfall_reasons.append(reason)
+
+        if shortfall_reasons:
+            order.needs_review = True
+            order.review_reason = "; ".join(shortfall_reasons)
+
         order.payment_status = "paid"
+        if attempt is not None:
+            order.lenco_reference = attempt.reference
         db.commit()
         return "paid"
 
     if collection.status == "failed":
         if order.payment_status != "paid":
-            order.payment_status = "failed"
-            db.commit()
+            other_active = (
+                db.query(PaymentAttempt.id)
+                .filter(
+                    PaymentAttempt.tenant_id == tenant_id,
+                    PaymentAttempt.order_id == order.id,
+                    PaymentAttempt.status.in_(ACTIVE_ATTEMPT_STATUSES),
+                )
+                .first()
+            )
+            if not other_active:
+                order.payment_status = "failed"
+        db.commit()
         return "failed"
 
-    return "pending"
+    db.commit()
+    return collection.status
 
 
 @app.post("/api/payments/mobile-money/initiate", response_model=MobileMoneyInitiateResponse)
@@ -865,6 +1013,7 @@ def initiate_mobile_money_payment(
     order = (
         db.query(Order)
         .filter(Order.id == payload.order_id, Order.tenant_id == tenant_id)
+        .with_for_update()
         .first()
     )
     if not order:
@@ -873,31 +1022,204 @@ def initiate_mobile_money_payment(
             detail=f"Order with id {payload.order_id} not found",
         )
 
-    if order.payment_status != "pending":
+    if order.payment_status == "paid":
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Order is not in pending status (current status: '{order.payment_status}')",
+            detail="Order is already paid",
         )
 
     normalized_phone = normalize_zambian_phone(payload.phone)
 
-    # Generate unguessable uuid4-based payment reference
-    lenco_ref = str(uuid.uuid4())
-    order.lenco_reference = lenco_ref
+    now = datetime.now(timezone.utc)
+    expiry_cutoff = now - timedelta(minutes=PAYMENT_ATTEMPT_EXPIRY_MINUTES)
 
+    # Check if an earlier attempt for this order is still active
+    existing_attempts = (
+        db.query(PaymentAttempt)
+        .filter(
+            PaymentAttempt.order_id == order.id,
+            PaymentAttempt.tenant_id == tenant_id,
+        )
+        .order_by(PaymentAttempt.id.asc())
+        .with_for_update()
+        .all()
+    )
+
+    for prev_attempt in existing_attempts:
+        if prev_attempt.status in ACTIVE_ATTEMPT_STATUSES:
+            provider_col = lenco_client.get_collection_by_reference(
+                prev_attempt.reference
+            )
+            effective_created = min(prev_attempt.created_at, order.created_at)
+            is_past_expiry = effective_created <= expiry_cutoff
+
+            if provider_col is not None:
+                _update_attempt_from_collection(prev_attempt, provider_col)
+                if provider_col.status == "successful":
+                    settle_order_with_collection(
+                        db=db,
+                        tenant_id=tenant_id,
+                        order=order,
+                        collection=provider_col,
+                        attempt=prev_attempt,
+                    )
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="Order has already been paid via an existing payment attempt",
+                    )
+                if provider_col.status in ("failed", "expired"):
+                    continue
+                if is_past_expiry:
+                    prev_attempt.status = "expired"
+                    prev_attempt.updated_at = now
+                    continue
+            else:
+                if is_past_expiry:
+                    prev_attempt.status = "expired"
+                    prev_attempt.updated_at = now
+                    continue
+
+            db.commit()
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"An active payment attempt ({prev_attempt.reference}) is already in progress for this order",
+            )
+
+    # Create a NEW payment attempt with an unguessable uuid4 reference (never overwrite an earlier attempt)
+    attempt_ref = str(uuid.uuid4())
     collection = lenco_client.collect_mobile_money(
-        reference=lenco_ref,
+        reference=attempt_ref,
         phone=normalized_phone,
         operator=payload.operator,
         amount_ngwee=order.total_ngwee,
         currency="ZMW",
     )
-    db.commit()
+
+    new_attempt = PaymentAttempt(
+        tenant_id=tenant_id,
+        order_id=order.id,
+        reference=attempt_ref,
+        lenco_reference=collection.lenco_reference,
+        status=collection.status,
+        fee_ngwee=collection.fee_ngwee,
+        fee_bearer=collection.fee_bearer,
+        settlement_status=collection.settlement_status,
+        created_at=now,
+        updated_at=now,
+    )
+    db.add(new_attempt)
+    order.lenco_reference = attempt_ref
+    if order.payment_status in ("failed", "expired"):
+        order.payment_status = "pending"
+    db.flush()
+
+    if collection.status == "successful":
+        settle_order_with_collection(
+            db=db,
+            tenant_id=tenant_id,
+            order=order,
+            collection=collection,
+            attempt=new_attempt,
+        )
+    elif collection.status == "failed":
+        order.payment_status = "failed"
+        db.commit()
+    else:
+        db.commit()
 
     return MobileMoneyInitiateResponse(
         status=collection.status,
         message=collection.message or "Mobile money prompt initiated",
-        lenco_reference=lenco_ref,
+        lenco_reference=attempt_ref,
+        reference=attempt_ref,
+        attempt_id=new_attempt.id,
+        provider_reference=collection.lenco_reference,
+    )
+
+
+@app.post(
+    "/api/payments/mobile-money/submit-otp",
+    response_model=MobileMoneyInitiateResponse,
+)
+def submit_mobile_money_otp(
+    payload: MobileMoneySubmitOtpRequest,
+    db: Session = Depends(get_tenant_db),
+    _: User = Depends(get_current_user),
+    lenco_client: LencoClient = Depends(get_lenco_client),
+):
+    tenant_id = db.info["tenant_id"]
+    order = (
+        db.query(Order)
+        .filter(Order.id == payload.order_id, Order.tenant_id == tenant_id)
+        .with_for_update()
+        .first()
+    )
+    if not order:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Order with id {payload.order_id} not found",
+        )
+
+    cleaned_otp = (payload.otp or "").strip()
+    if not cleaned_otp:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="OTP is required",
+        )
+
+    attempt_query = db.query(PaymentAttempt).filter(
+        PaymentAttempt.order_id == order.id,
+        PaymentAttempt.tenant_id == tenant_id,
+    )
+    if payload.reference:
+        attempt = (
+            attempt_query.filter(PaymentAttempt.reference == payload.reference)
+            .with_for_update()
+            .first()
+        )
+    else:
+        attempt = (
+            attempt_query.order_by(PaymentAttempt.id.desc())
+            .with_for_update()
+            .first()
+        )
+
+    if not attempt:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No payment attempt found for this order",
+        )
+
+    collection = lenco_client.submit_mobile_money_otp(
+        reference=attempt.reference,
+        otp=cleaned_otp,
+        lenco_reference=attempt.lenco_reference,
+    )
+
+    _update_attempt_from_collection(attempt, collection)
+
+    if collection.status == "successful":
+        settle_order_with_collection(
+            db=db,
+            tenant_id=tenant_id,
+            order=order,
+            collection=collection,
+            attempt=attempt,
+        )
+    elif collection.status == "failed":
+        if order.payment_status != "paid":
+            order.payment_status = "failed"
+        db.commit()
+    else:
+        db.commit()
+
+    return MobileMoneyInitiateResponse(
+        status=collection.status,
+        message=collection.message or "OTP submitted",
+        lenco_reference=attempt.reference,
+        reference=attempt.reference,
+        attempt_id=attempt.id,
+        provider_reference=attempt.lenco_reference,
     )
 
 
@@ -932,12 +1254,16 @@ async def lenco_webhook(
         return {"status": "ignored", "event": event}
 
     data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
-    reference = data.get("reference") or payload.get("reference") or payload.get("lenco_reference")
+    reference = (
+        data.get("reference")
+        or payload.get("reference")
+        or payload.get("lenco_reference")
+    )
     if not reference or not isinstance(reference, str):
         logger.warning("Lenco webhook missing reference for event=%s", event)
         return {"status": "ignored", "reason": "missing_reference"}
 
-    # 4. Resolve tenant_id via narrow SECURITY DEFINER lookup (returns only UUID tenant_id)
+    # 4. Resolve tenant_id via narrow SECURITY DEFINER lookup (looks in payment_attempts then orders)
     tenant_id = db.execute(
         text("SELECT resolve_tenant_for_lenco_ref(:ref)"),
         {"ref": reference},
@@ -949,39 +1275,78 @@ async def lenco_webhook(
     # Set app.current_tenant and continue under normal RLS (bomapos_app has NOBYPASSRLS)
     bind_session_to_tenant(db, tenant_id)
 
-    order = (
-        db.query(Order)
+    attempt = (
+        db.query(PaymentAttempt)
         .filter(
-            Order.lenco_reference == reference,
-            Order.tenant_id == tenant_id,
+            PaymentAttempt.tenant_id == tenant_id,
+            (PaymentAttempt.reference == reference)
+            | (PaymentAttempt.lenco_reference == reference),
         )
         .with_for_update()
         .first()
     )
+
+    if attempt is not None:
+        order = (
+            db.query(Order)
+            .filter(Order.id == attempt.order_id, Order.tenant_id == tenant_id)
+            .with_for_update()
+            .first()
+        )
+    else:
+        order = (
+            db.query(Order)
+            .filter(
+                Order.lenco_reference == reference,
+                Order.tenant_id == tenant_id,
+            )
+            .with_for_update()
+            .first()
+        )
+
     if not order:
-        logger.warning("Lenco webhook order not found under tenant for reference=%s", reference)
+        logger.warning(
+            "Lenco webhook order not found under tenant for reference=%s", reference
+        )
         return {"status": "ignored", "reason": "unknown_reference"}
 
     expected_status = "successful" if event == "collection.successful" else "failed"
 
     # Idempotency check: replays are a no-op
     if order.payment_status == "paid":
+        if attempt is not None and attempt.status != "successful" and expected_status == "successful":
+            col = lenco_client.get_collection_by_reference(attempt.reference)
+            if col and col.status == "successful":
+                _update_attempt_from_collection(attempt, col)
+                db.commit()
         return {"status": "noop", "message": "Order already marked paid"}
-    if order.payment_status == "failed" and expected_status == "failed":
+
+    if (
+        attempt is not None
+        and attempt.status == "failed"
+        and order.payment_status == "failed"
+        and expected_status == "failed"
+    ):
         return {"status": "noop", "message": "Order already marked failed"}
 
     # 5. Re-fetch collection from Lenco and verify status, amount, and currency match the order
-    collection = lenco_client.get_collection_by_reference(reference)
+    lookup_ref = attempt.reference if attempt is not None else reference
+    collection = lenco_client.get_collection_by_reference(lookup_ref)
     outcome = settle_order_with_collection(
         db=db,
         tenant_id=tenant_id,
         order=order,
         collection=collection,
         expected_status=expected_status,
+        attempt=attempt,
     )
 
     if outcome == "paid":
-        return {"status": "success", "message": "Payment confirmed and drink stock updated"}
+        return {
+            "status": "success",
+            "message": "Payment confirmed and drink stock updated",
+            "needs_review": order.needs_review,
+        }
     if outcome == "failed":
         return {"status": "failed", "message": "Order marked as payment failed"}
     return {"status": outcome, "message": "No state transition required"}
@@ -994,63 +1359,155 @@ def reconcile_tenant_pending_orders(
     older_than_minutes: int = 10,
 ) -> ReconciliationResponse:
     """
-    Find orders in `tenant_id` stuck in pending payment for more than `older_than_minutes`,
-    query Lenco by reference, and settle them using the same verification & stock-deduction path as webhooks.
+    Reconcile payment attempts in `tenant_id` without holding FOR UPDATE row locks across Lenco HTTP calls:
+      1. Read candidate attempts in batches of 50 without locking.
+      2. Call Lenco (`get_collection_by_reference`) outside any row lock.
+      3. Lock the single attempt & order rows with FOR UPDATE, re-check state, and settle or expire.
+    Orders/attempts pending > 30 minutes and confirmed not-successful at Lenco become status='expired'.
     """
-    bind_session_to_tenant(db, tenant_id)
-    cutoff = datetime.now(timezone.utc) - timedelta(minutes=older_than_minutes)
-
-    stuck_orders = (
-        db.query(Order)
-        .filter(
-            Order.tenant_id == tenant_id,
-            Order.payment_method == "mobile_money",
-            Order.payment_status == "pending",
-            Order.lenco_reference.isnot(None),
-            Order.created_at <= cutoff,
-        )
-        .with_for_update()
-        .all()
-    )
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(minutes=older_than_minutes)
+    expiry_cutoff = now - timedelta(minutes=PAYMENT_ATTEMPT_EXPIRY_MINUTES)
 
     checked = 0
     paid_count = 0
     failed_count = 0
+    expired_count = 0
     pending_count = 0
 
-    for order in stuck_orders:
-        checked += 1
-        collection = lenco_client.get_collection_by_reference(order.lenco_reference)
-        if collection is None or collection.status == "pending":
-            pending_count += 1
-            continue
+    last_seen_id = 0
+    while True:
+        bind_session_to_tenant(db, tenant_id)
+        candidates = (
+            db.query(PaymentAttempt.id, PaymentAttempt.reference)
+            .join(
+                Order,
+                (Order.id == PaymentAttempt.order_id)
+                & (Order.tenant_id == PaymentAttempt.tenant_id),
+            )
+            .filter(
+                PaymentAttempt.tenant_id == tenant_id,
+                PaymentAttempt.id > last_seen_id,
+                Order.payment_method == "mobile_money",
+                Order.payment_status.in_(("pending", "expired")),
+                PaymentAttempt.status.in_((*ACTIVE_ATTEMPT_STATUSES, "expired")),
+                (PaymentAttempt.created_at <= cutoff) | (Order.created_at <= cutoff),
+            )
+            .order_by(PaymentAttempt.id.asc())
+            .limit(RECONCILE_BATCH_SIZE)
+            .all()
+        )
+        # End read transaction so no locks or snapshots are held during Lenco HTTP requests
+        db.commit()
 
-        try:
-            outcome = settle_order_with_collection(
-                db=db,
-                tenant_id=tenant_id,
-                order=order,
-                collection=collection,
+        if not candidates:
+            break
+
+        for attempt_id, attempt_ref in candidates:
+            last_seen_id = max(last_seen_id, attempt_id)
+            checked += 1
+
+            # 2. Call Lenco outside any database row lock
+            collection = lenco_client.get_collection_by_reference(attempt_ref)
+
+            # 3. Lock the single attempt + order row, re-check state, and settle or expire
+            bind_session_to_tenant(db, tenant_id)
+            locked_attempt = (
+                db.query(PaymentAttempt)
+                .filter(
+                    PaymentAttempt.id == attempt_id,
+                    PaymentAttempt.tenant_id == tenant_id,
+                )
+                .with_for_update()
+                .first()
             )
-            if outcome == "paid":
-                paid_count += 1
-            elif outcome == "failed":
-                failed_count += 1
+            if not locked_attempt:
+                db.commit()
+                continue
+
+            locked_order = (
+                db.query(Order)
+                .filter(
+                    Order.id == locked_attempt.order_id,
+                    Order.tenant_id == tenant_id,
+                )
+                .with_for_update()
+                .first()
+            )
+            if not locked_order or locked_order.payment_status == "paid":
+                db.commit()
+                continue
+
+            # If already expired and still not successful at Lenco, nothing further to transition
+            if locked_attempt.status == "expired" and (
+                collection is None or collection.status != "successful"
+            ):
+                db.commit()
+                continue
+
+            if locked_attempt.status not in (*ACTIVE_ATTEMPT_STATUSES, "expired"):
+                db.commit()
+                continue
+
+            effective_created = min(locked_attempt.created_at, locked_order.created_at)
+            is_expired_by_age = effective_created <= expiry_cutoff
+
+            if collection is not None and collection.status in ("successful", "failed"):
+                try:
+                    outcome = settle_order_with_collection(
+                        db=db,
+                        tenant_id=tenant_id,
+                        order=locked_order,
+                        collection=collection,
+                        attempt=locked_attempt,
+                    )
+                    if outcome == "paid":
+                        paid_count += 1
+                    elif outcome == "failed":
+                        failed_count += 1
+                    else:
+                        pending_count += 1
+                except HTTPException as exc:
+                    db.rollback()
+                    logger.warning(
+                        "Reconciliation skipped order_id=%s ref=%s due to verification mismatch: %s",
+                        locked_order.id,
+                        attempt_ref,
+                        exc.detail,
+                    )
+                    pending_count += 1
+                continue
+
+            # Confirmed not-successful at Lenco (collection is None or still pending/pay-offline/otp-required)
+            if collection is not None:
+                _update_attempt_from_collection(locked_attempt, collection)
+
+            if is_expired_by_age:
+                locked_attempt.status = "expired"
+                locked_attempt.updated_at = datetime.now(timezone.utc)
+                other_active = (
+                    db.query(PaymentAttempt.id)
+                    .filter(
+                        PaymentAttempt.tenant_id == tenant_id,
+                        PaymentAttempt.order_id == locked_order.id,
+                        PaymentAttempt.id != locked_attempt.id,
+                        PaymentAttempt.status.in_(ACTIVE_ATTEMPT_STATUSES),
+                    )
+                    .first()
+                )
+                if not other_active and locked_order.payment_status == "pending":
+                    locked_order.payment_status = "expired"
+                db.commit()
+                expired_count += 1
             else:
+                db.commit()
                 pending_count += 1
-        except HTTPException as exc:
-            logger.warning(
-                "Reconciliation skipped order_id=%s ref=%s due to verification mismatch: %s",
-                order.id,
-                order.lenco_reference,
-                exc.detail,
-            )
-            pending_count += 1
 
     return ReconciliationResponse(
         checked_count=checked,
         settled_paid_count=paid_count,
         settled_failed_count=failed_count,
+        expired_count=expired_count,
         still_pending_count=pending_count,
     )
 
@@ -1077,9 +1534,35 @@ def reconcile_all_tenants_stuck_orders(
         db.close()
 
 
+@app.post("/internal/reconcile", response_model=Dict[str, ReconciliationResponse])
+def internal_reconcile_cron(
+    older_than_minutes: int = Query(5, ge=0),
+    x_cron_secret: Optional[str] = Header(None, alias="X-Cron-Secret"),
+    lenco_client: LencoClient = Depends(get_lenco_client),
+):
+    """
+    Internal cron endpoint meant to be invoked every 5 minutes by the host scheduler.
+    Protected by X-Cron-Secret header matching CRON_SECRET env var.
+    """
+    expected_secret = get_cron_secret()
+    if (
+        not expected_secret
+        or not x_cron_secret
+        or not hmac.compare_digest(expected_secret, x_cron_secret.strip())
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing or invalid X-Cron-Secret header",
+        )
+    return reconcile_all_tenants_stuck_orders(
+        older_than_minutes=older_than_minutes,
+        lenco_client=lenco_client,
+    )
+
+
 @app.post("/api/payments/reconcile", response_model=ReconciliationResponse)
 def reconcile_pending_payments(
-    older_than_minutes: int = Query(10, ge=1),
+    older_than_minutes: int = Query(10, ge=0),
     db: Session = Depends(get_tenant_db),
     _: User = Depends(require_owner),
     lenco_client: LencoClient = Depends(get_lenco_client),
@@ -1100,24 +1583,54 @@ def get_payment_status(
     _: User = Depends(get_current_user),
 ):
     tenant_id = db.info["tenant_id"]
-    order = (
-        db.query(Order)
+    attempt = (
+        db.query(PaymentAttempt)
         .filter(
-            Order.lenco_reference == lenco_reference,
-            Order.tenant_id == tenant_id,
+            PaymentAttempt.tenant_id == tenant_id,
+            (PaymentAttempt.reference == lenco_reference)
+            | (PaymentAttempt.lenco_reference == lenco_reference),
         )
+        .order_by(PaymentAttempt.id.desc())
         .first()
     )
+
+    if attempt is not None:
+        order = (
+            db.query(Order)
+            .filter(Order.id == attempt.order_id, Order.tenant_id == tenant_id)
+            .first()
+        )
+    else:
+        order = (
+            db.query(Order)
+            .filter(
+                Order.lenco_reference == lenco_reference,
+                Order.tenant_id == tenant_id,
+            )
+            .first()
+        )
+
     if not order:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Order with lenco_reference '{lenco_reference}' not found",
         )
 
+    distinct_status = (
+        attempt.status
+        if attempt is not None
+        else ("successful" if order.payment_status == "paid" else order.payment_status)
+    )
+    if order.payment_status == "paid":
+        distinct_status = "successful"
+
     return PaymentStatusResponse(
         order_id=order.id,
         payment_status=order.payment_status,
-        lenco_reference=order.lenco_reference,
+        status=distinct_status,
+        lenco_reference=attempt.reference if attempt is not None else order.lenco_reference,
+        needs_review=bool(order.needs_review),
+        review_reason=order.review_reason,
     )
 
 
@@ -1184,12 +1697,27 @@ def get_dashboard_summary(
         DrinkInventoryWithItemResponse.model_validate(inv) for inv in low_stock_records
     ]
 
+    needs_review_records = (
+        db.query(Order)
+        .filter(
+            Order.tenant_id == tenant_id,
+            Order.needs_review.is_(True),
+        )
+        .order_by(Order.created_at.desc())
+        .all()
+    )
+    needs_review_orders = [
+        OrderResponse.model_validate(o) for o in needs_review_records
+    ]
+
     return DashboardSummaryResponse(
         today_total_revenue_ngwee=int(today_row.total_ngwee),
         today_cash_revenue_ngwee=int(today_row.cash_ngwee),
         settlement_account_balance_ngwee=int(settlement_ngwee),
         today_orders_count=int(today_row.orders_count),
         low_stock_alerts=low_stock_alerts,
+        needs_review_count=len(needs_review_orders),
+        needs_review_orders=needs_review_orders,
     )
 
 
