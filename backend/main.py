@@ -26,6 +26,8 @@ try:
         ACTIVE_ATTEMPT_STATUSES,
         LencoClient,
         LencoCollectionResult,
+        LencoRejectedError,
+        LencoUnavailableError,
         format_zambian_phone,
         get_lenco_client,
         verify_lenco_webhook_signature,
@@ -68,6 +70,8 @@ except ImportError:
         ACTIVE_ATTEMPT_STATUSES,
         LencoClient,
         LencoCollectionResult,
+        LencoRejectedError,
+        LencoUnavailableError,
         format_zambian_phone,
         get_lenco_client,
         verify_lenco_webhook_signature,
@@ -1006,6 +1010,25 @@ def settle_order_with_collection(
             if attempt is not None:
                 attempt.status = "successful"
                 attempt.updated_at = datetime.now(timezone.utc)
+
+            # Move any other active attempts older than PAYMENT_ATTEMPT_EXPIRY_MINUTES to 'expired'
+            now_utc = datetime.now(timezone.utc)
+            active_cutoff = now_utc - timedelta(minutes=PAYMENT_ATTEMPT_EXPIRY_MINUTES)
+            other_active_attempts = (
+                db.query(PaymentAttempt)
+                .filter(
+                    PaymentAttempt.tenant_id == tenant_id,
+                    PaymentAttempt.order_id == order.id,
+                    PaymentAttempt.id != (attempt.id if attempt else -1),
+                    PaymentAttempt.status.in_(ACTIVE_ATTEMPT_STATUSES),
+                    PaymentAttempt.created_at <= active_cutoff,
+                )
+                .all()
+            )
+            for other_att in other_active_attempts:
+                other_att.status = "expired"
+                other_att.updated_at = now_utc
+
             db.commit()
             return "duplicate_paid"
 
@@ -1030,6 +1053,25 @@ def settle_order_with_collection(
         order.payment_status = "paid"
         if attempt is not None:
             order.lenco_reference = attempt.reference
+
+        # Move any other active attempts older than PAYMENT_ATTEMPT_EXPIRY_MINUTES to 'expired'
+        now_utc = datetime.now(timezone.utc)
+        active_cutoff = now_utc - timedelta(minutes=PAYMENT_ATTEMPT_EXPIRY_MINUTES)
+        other_active_attempts = (
+            db.query(PaymentAttempt)
+            .filter(
+                PaymentAttempt.tenant_id == tenant_id,
+                PaymentAttempt.order_id == order.id,
+                PaymentAttempt.id != (attempt.id if attempt else -1),
+                PaymentAttempt.status.in_(ACTIVE_ATTEMPT_STATUSES),
+                PaymentAttempt.created_at <= active_cutoff,
+            )
+            .all()
+        )
+        for other_att in other_active_attempts:
+            other_att.status = "expired"
+            other_att.updated_at = now_utc
+
         db.commit()
         return "paid"
 
@@ -1197,9 +1239,41 @@ def initiate_mobile_money_payment(
         )
     except HTTPException:
         raise
-    except Exception as exc:
+    except LencoRejectedError as exc:
+        logger.warning(
+            "Lenco collect_mobile_money rejected for ref=%s: %s",
+            attempt_ref,
+            exc,
+        )
+        bind_session_to_tenant(db, tenant_id)
+        attempt_in_db = (
+            db.query(PaymentAttempt)
+            .filter(
+                PaymentAttempt.id == new_attempt.id,
+                PaymentAttempt.tenant_id == tenant_id,
+            )
+            .with_for_update()
+            .first()
+        )
+        order_in_db = (
+            db.query(Order)
+            .filter(Order.id == order.id, Order.tenant_id == tenant_id)
+            .with_for_update()
+            .first()
+        )
+        if attempt_in_db is not None:
+            attempt_in_db.status = "failed"
+            attempt_in_db.updated_at = datetime.now(timezone.utc)
+        if order_in_db is not None:
+            order_in_db.payment_status = "failed"
+        db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc) or "Payment collection was rejected by provider",
+        )
+    except (LencoUnavailableError, Exception) as exc:
         logger.error(
-            "Lenco collect_mobile_money failed for ref=%s: %s",
+            "Lenco collect_mobile_money unavailable for ref=%s: %s",
             attempt_ref,
             exc,
             exc_info=True,
@@ -1555,6 +1629,7 @@ def reconcile_tenant_pending_orders(
     cutoff = now - timedelta(minutes=older_than_minutes)
     initiating_cutoff = now - timedelta(minutes=2)
     abandoned_cutoff = now - timedelta(minutes=60)
+    expired_window_cutoff = now - timedelta(hours=48)
     expiry_cutoff = now - timedelta(minutes=PAYMENT_ATTEMPT_EXPIRY_MINUTES)
 
     checked = 0
@@ -1562,6 +1637,7 @@ def reconcile_tenant_pending_orders(
     failed_count = 0
     expired_count = 0
     pending_count = 0
+    error_count = 0
 
     last_seen_id = 0
     while True:
@@ -1583,12 +1659,16 @@ def reconcile_tenant_pending_orders(
                         PaymentAttempt.created_at <= initiating_cutoff,
                     ),
                     and_(
-                        PaymentAttempt.status.in_(("pending", "otp-required", "pay-offline", "expired")),
+                        PaymentAttempt.status.in_(("pending", "otp-required", "pay-offline")),
                         (PaymentAttempt.created_at <= cutoff) | (Order.created_at <= cutoff),
                     ),
                     and_(
+                        PaymentAttempt.status == "expired",
+                        PaymentAttempt.created_at >= expired_window_cutoff,
+                    ),
+                    and_(
                         PaymentAttempt.status == "abandoned",
-                        PaymentAttempt.created_at >= abandoned_cutoff,
+                        PaymentAttempt.updated_at >= abandoned_cutoff,
                     ),
                 ),
             )
@@ -1606,8 +1686,18 @@ def reconcile_tenant_pending_orders(
             last_seen_id = max(last_seen_id, attempt_id)
             checked += 1
 
-            # 2. Call Lenco outside any database row lock
-            collection = lenco_client.get_collection_by_reference(attempt_ref)
+            # 2. Call Lenco outside any database row lock with failure isolation
+            try:
+                collection = lenco_client.get_collection_by_reference(attempt_ref)
+            except RuntimeError as exc:
+                logger.warning(
+                    "Reconciliation query failed for attempt_ref=%s: %s",
+                    attempt_ref,
+                    exc.__class__.__name__,
+                )
+                pending_count += 1
+                error_count += 1
+                continue
 
             # 3. Lock the single attempt + order row, re-check state, and settle or expire
             bind_session_to_tenant(db, tenant_id)
@@ -1819,6 +1909,7 @@ def reconcile_tenant_pending_orders(
         settled_failed_count=failed_count,
         expired_count=expired_count,
         still_pending_count=pending_count,
+        error_count=error_count,
     )
 
 
@@ -1833,12 +1924,27 @@ def reconcile_all_tenants_stuck_orders(
     try:
         active_tenants = db.query(Tenant).filter(Tenant.status == "active").all()
         for tenant in active_tenants:
-            results[tenant.slug] = reconcile_tenant_pending_orders(
-                db=db,
-                tenant_id=tenant.id,
-                lenco_client=client_impl,
-                older_than_minutes=older_than_minutes,
-            )
+            try:
+                results[tenant.slug] = reconcile_tenant_pending_orders(
+                    db=db,
+                    tenant_id=tenant.id,
+                    lenco_client=client_impl,
+                    older_than_minutes=older_than_minutes,
+                )
+            except Exception as exc:
+                logger.error(
+                    "Tenant reconciliation failed for tenant_slug=%s: %s",
+                    tenant.slug,
+                    exc.__class__.__name__,
+                )
+                results[tenant.slug] = ReconciliationResponse(
+                    checked_count=0,
+                    settled_paid_count=0,
+                    settled_failed_count=0,
+                    expired_count=0,
+                    still_pending_count=0,
+                    error_count=1,
+                )
         return results
     finally:
         db.close()
