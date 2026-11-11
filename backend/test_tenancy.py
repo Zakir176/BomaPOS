@@ -22,7 +22,7 @@ from fastapi.testclient import TestClient
 from main import app
 from database import SessionLocal, AdminSessionLocal, bind_session_to_tenant
 from lenco_client import compute_lenco_webhook_signature, mock_lenco_client
-from models import User, MenuItem, DrinkInventory, Order, OrderItem
+from models import User, MenuItem, DrinkInventory, Order, OrderItem, PaymentAttempt
 from seed import seed, TENANT_A_ID, TENANT_B_ID
 
 client = TestClient(app)
@@ -333,4 +333,91 @@ def test_database_composite_foreign_keys_and_rls_enforcement():
         admin_db.rollback()
     finally:
         admin_db.close()
+
+
+def test_payment_attempts_cross_tenant_isolation_and_rls():
+    """
+    Requirement 1 & 7:
+    Verify cross-tenant isolation on payment_attempts via API, ORM scoping, Postgres RLS,
+    and composite FK (fk_payment_attempts_order_tenant).
+    """
+    seed()
+    mock_lenco_client.reset()
+    a_owner, a_cashier, b_owner, b_cashier = _get_tokens()
+
+    menu_a = client.get("/api/menu", headers=_auth_header(a_cashier)).json()
+    item_a = next(i for i in menu_a if i["category"] == "meal")
+
+    res_order_a = client.post(
+        "/api/orders",
+        json={
+            "payment_method": "mobile_money",
+            "items": [{"menu_item_id": item_a["id"], "quantity": 1}],
+        },
+        headers=_auth_header(a_cashier),
+    )
+    assert res_order_a.status_code == 201
+    order_a_id = res_order_a.json()["id"]
+
+    mock_lenco_client.set_next_initial_status("otp-required")
+    res_init_a = client.post(
+        "/api/payments/mobile-money/initiate",
+        json={"order_id": order_a_id, "phone": "0977120000", "operator": "airtel"},
+        headers=_auth_header(a_cashier),
+    )
+    assert res_init_a.status_code == 200
+    ref_a = res_init_a.json()["lenco_reference"]
+
+    # 1. Tenant B cannot query status or submit OTP for Tenant A's order/attempt
+    res_b_status = client.get(
+        f"/api/payments/status/{ref_a}", headers=_auth_header(b_cashier)
+    )
+    assert res_b_status.status_code == 404
+
+    res_b_otp = client.post(
+        "/api/payments/mobile-money/submit-otp",
+        json={"order_id": order_a_id, "otp": "123456", "reference": ref_a},
+        headers=_auth_header(b_cashier),
+    )
+    assert res_b_otp.status_code == 404
+
+    # 2. Verify Postgres RLS on payment_attempts: unscoped and Tenant B sessions see 0 rows
+    db = SessionLocal()
+    try:
+        unscoped_count = db.execute(
+            text("SELECT count(*) FROM payment_attempts")
+        ).scalar()
+        assert unscoped_count == 0
+
+        bind_session_to_tenant(db, TENANT_B_ID)
+        b_count = db.execute(
+            text("SELECT count(*) FROM payment_attempts")
+        ).scalar()
+        assert b_count == 0
+        assert db.query(PaymentAttempt).count() == 0
+
+        bind_session_to_tenant(db, TENANT_A_ID)
+        a_count = db.execute(
+            text("SELECT count(*) FROM payment_attempts")
+        ).scalar()
+        assert a_count == 1
+    finally:
+        db.close()
+
+    # 3. Verify composite FK fk_payment_attempts_order_tenant rejects cross-tenant order reference
+    admin_db = AdminSessionLocal()
+    try:
+        bad_attempt = PaymentAttempt(
+            tenant_id=TENANT_B_ID,
+            order_id=order_a_id,
+            reference="cross-tenant-ref-001",
+            status="pending",
+        )
+        admin_db.add(bad_attempt)
+        with pytest.raises(IntegrityError):
+            admin_db.commit()
+        admin_db.rollback()
+    finally:
+        admin_db.close()
+
 
