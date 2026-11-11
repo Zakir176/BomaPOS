@@ -156,6 +156,16 @@
             <span v-if="isSubmitting">Verifying OTP...</span>
             <span v-else>Submit OTP</span>
           </button>
+
+          <button
+            type="button"
+            class="btn-pill-outline dispatch-btn"
+            style="margin-top: 8px; width: 100%;"
+            @click="handleAbandonAndRetry"
+          >
+            <RefreshCw :size="14" :stroke-width="2.2" />
+            <span>Change number / retry</span>
+          </button>
         </div>
 
         <!-- ============================================== -->
@@ -179,6 +189,16 @@
               Ref: {{ lencoReference }} • Status: {{ lencoStatus }}
             </div>
           </div>
+
+          <button
+            type="button"
+            class="btn-pill-outline dispatch-btn"
+            style="margin-bottom: 12px; width: 100%;"
+            @click="handleAbandonAndRetry"
+          >
+            <RefreshCw :size="14" :stroke-width="2.2" />
+            <span>Change number / retry</span>
+          </button>
 
           <!-- Developer Simulator Sandbox -->
           <div class="dev-box card-bento">
@@ -446,6 +466,19 @@ const handleSubmitOtp = async () => {
   } finally {
     isSubmitting.value = false;
   }
+};
+
+const handleAbandonAndRetry = async () => {
+  stopPolling();
+  errorMessage.value = '';
+  if (currentOrderId.value && lencoReference.value) {
+    try {
+      await api.abandonMobileMoney(currentOrderId.value, lencoReference.value);
+    } catch (e) {
+      console.warn('Failed to abandon attempt on backend:', e);
+    }
+  }
+  step.value = 'input';
 };
 
 const startPolling = (refString) => {
