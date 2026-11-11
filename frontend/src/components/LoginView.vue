@@ -120,7 +120,13 @@ const handleLogin = async () => {
   errorMessage.value = '';
 
   try {
-    const res = await api.login(tenantSlug.value, username.value, password.value);
+    const slug = (tenantSlug.value || '').trim();
+    if (!slug) {
+      errorMessage.value = 'Please enter your tenant slug.';
+      isLoading.value = false;
+      return;
+    }
+    const res = await api.login(slug, username.value, password.value);
     authState.login(
       {
         id: res.id,
