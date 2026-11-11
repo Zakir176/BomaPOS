@@ -111,7 +111,55 @@
         </div>
 
         <!-- ============================================== -->
-        <!-- STEP 2: Waiting for Customer PIN                -->
+        <!-- STEP 1B: OTP Required Input                     -->
+        <!-- ============================================== -->
+        <div v-else-if="step === 'otp'" class="waiting-screen">
+          <div class="pulse-beacon">
+            <div class="beacon-circle">
+              <Smartphone class="pulse-icon" :size="24" :stroke-width="2.2" />
+            </div>
+          </div>
+
+          <div class="waiting-text">
+            <h4>Enter Mobile Money OTP</h4>
+            <p>
+              Enter the one-time password sent to <strong>+260 {{ rawDigits }}</strong> ({{ selectedOperator.toUpperCase() }}).
+            </p>
+            <div class="badge-pill badge-pill-charcoal ref-pill font-data-mono">
+              Ref: {{ lencoReference }}
+            </div>
+          </div>
+
+          <div class="phone-display-capsule card-bento" style="width: 100%; margin-bottom: 6px;">
+            <input
+              v-model="otpCode"
+              type="text"
+              inputmode="numeric"
+              maxlength="8"
+              placeholder="Enter OTP code..."
+              class="phone-readout font-data-mono"
+              @keyup.enter="handleSubmitOtp"
+            />
+          </div>
+
+          <div v-if="errorMessage" class="badge-pill badge-pill-red error-pill">
+            <AlertCircle :size="13" :stroke-width="2.5" />
+            <span>{{ errorMessage }}</span>
+          </div>
+
+          <button
+            class="btn-pill-primary dispatch-btn"
+            :disabled="isSubmitting || !otpCode.trim()"
+            @click="handleSubmitOtp"
+          >
+            <Send :size="15" :stroke-width="2.2" />
+            <span v-if="isSubmitting">Verifying OTP...</span>
+            <span v-else>Submit OTP</span>
+          </button>
+        </div>
+
+        <!-- ============================================== -->
+        <!-- STEP 2: Waiting / Approve on your phone         -->
         <!-- ============================================== -->
         <div v-else-if="step === 'waiting'" class="waiting-screen">
           <div class="pulse-beacon">
@@ -121,13 +169,14 @@
           </div>
 
           <div class="waiting-text">
-            <h4>Customer PIN Prompt Dispatched</h4>
+            <h4>{{ lencoStatus === 'pay-offline' ? 'Approve on your phone' : 'Customer PIN Prompt Dispatched' }}</h4>
             <p>
-              A prompt was sent to <strong>+260 {{ rawDigits }}</strong> via
-              <strong>{{ selectedOperator.toUpperCase() }}</strong>.
+              {{ lencoStatus === 'pay-offline'
+                 ? `Please approve the payment prompt on your phone (+260 ${rawDigits} via ${selectedOperator.toUpperCase()}).`
+                 : `A prompt was sent to +260 ${rawDigits} via ${selectedOperator.toUpperCase()}.` }}
             </p>
             <div class="badge-pill badge-pill-charcoal ref-pill font-data-mono">
-              Ref: {{ lencoReference }}
+              Ref: {{ lencoReference }} • Status: {{ lencoStatus }}
             </div>
           </div>
 
@@ -259,15 +308,22 @@ const props = defineProps({
 
 const emit = defineEmits(['close', 'order-completed']);
 
-const step = ref('input'); // 'input', 'waiting', 'success', 'failed'
+const POLL_INTERVAL_MS = 3000;
+const POLL_TIMEOUT_MS = 120000;
+
+const step = ref('input'); // 'input', 'otp', 'waiting', 'success', 'failed'
+const lencoStatus = ref('pending');
 const selectedOperator = ref('airtel');
 const rawDigits = ref('0977123456');
+const otpCode = ref('');
+const currentOrderId = ref(null);
 const isSubmitting = ref(false);
 const isSimulating = ref(false);
 const isOfflineQueued = ref(false);
 const errorMessage = ref('');
 const lencoReference = ref('');
 let pollInterval = null;
+let pollTimeout = null;
 
 const formattedPhone = computed(() => rawDigits.value);
 
@@ -303,11 +359,33 @@ const stopPolling = () => {
     clearInterval(pollInterval);
     pollInterval = null;
   }
+  if (pollTimeout) {
+    clearTimeout(pollTimeout);
+    pollTimeout = null;
+  }
 };
 
 onUnmounted(() => {
   stopPolling();
 });
+
+const applyAttemptStatusTransition = (statusStr, refStr) => {
+  lencoStatus.value = statusStr || 'pending';
+  if (statusStr === 'successful' || statusStr === 'paid') {
+    stopPolling();
+    step.value = 'success';
+  } else if (statusStr === 'failed' || statusStr === 'expired') {
+    stopPolling();
+    step.value = 'failed';
+  } else if (statusStr === 'otp-required') {
+    stopPolling();
+    otpCode.value = '';
+    step.value = 'otp';
+  } else {
+    step.value = 'waiting';
+    startPolling(refStr);
+  }
+};
 
 const handleInitiate = async () => {
   if (!rawDigits.value) return;
@@ -331,18 +409,19 @@ const handleInitiate = async () => {
       return;
     }
 
-    const orderRes = await api.createOrder(orderPayload, cartState.items);
-    const orderId = orderRes.id;
+    if (!currentOrderId.value) {
+      const orderRes = await api.createOrder(orderPayload, cartState.items);
+      currentOrderId.value = orderRes.id;
+    }
 
     const initRes = await api.initiateMobileMoney(
-      orderId,
+      currentOrderId.value,
       rawDigits.value,
       selectedOperator.value
     );
 
     lencoReference.value = initRes.lenco_reference;
-    step.value = 'waiting';
-    startPolling(lencoReference.value);
+    applyAttemptStatusTransition(initRes.status, lencoReference.value);
   } catch (err) {
     errorMessage.value = err.message || 'Failed to dispatch mobile money push prompt';
   } finally {
@@ -350,22 +429,60 @@ const handleInitiate = async () => {
   }
 };
 
+const handleSubmitOtp = async () => {
+  if (!currentOrderId.value || !otpCode.value.trim()) return;
+  isSubmitting.value = true;
+  errorMessage.value = '';
+  try {
+    const otpRes = await api.submitMobileMoneyOtp(
+      currentOrderId.value,
+      otpCode.value.trim(),
+      lencoReference.value
+    );
+    lencoReference.value = otpRes.lenco_reference || lencoReference.value;
+    applyAttemptStatusTransition(otpRes.status, lencoReference.value);
+  } catch (err) {
+    errorMessage.value = err.message || 'Failed to verify OTP';
+  } finally {
+    isSubmitting.value = false;
+  }
+};
+
 const startPolling = (refString) => {
   stopPolling();
+  pollTimeout = setTimeout(() => {
+    stopPolling();
+    if (step.value === 'waiting') {
+      errorMessage.value = 'Payment confirmation timed out.';
+      step.value = 'failed';
+    }
+  }, POLL_TIMEOUT_MS);
+
   pollInterval = setInterval(async () => {
     try {
       const statusRes = await api.pollPaymentStatus(refString);
-      if (statusRes.payment_status === 'paid') {
+      if (statusRes.status) {
+        lencoStatus.value = statusRes.status;
+      }
+      if (statusRes.payment_status === 'paid' || statusRes.status === 'successful') {
         stopPolling();
         step.value = 'success';
-      } else if (statusRes.payment_status === 'failed') {
+      } else if (
+        statusRes.payment_status === 'failed' ||
+        statusRes.payment_status === 'expired' ||
+        statusRes.status === 'failed' ||
+        statusRes.status === 'expired'
+      ) {
         stopPolling();
         step.value = 'failed';
+      } else if (statusRes.status === 'otp-required') {
+        stopPolling();
+        step.value = 'otp';
       }
     } catch (e) {
       console.warn('Polling error:', e);
     }
-  }, 1500);
+  }, POLL_INTERVAL_MS);
 };
 
 const simulateWebhook = async (status) => {
