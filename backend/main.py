@@ -235,27 +235,53 @@ LOGIN_RATE_LIMIT_WINDOW_SECONDS = 60
 _login_attempts: Dict[str, List[float]] = {}
 
 
+def get_client_ip(request: Request) -> str:
+    """Extract client IP; use first hop in X-Forwarded-For only when TRUST_PROXY=true."""
+    trust_proxy = os.getenv("TRUST_PROXY", "").strip().lower() in ("true", "1", "yes")
+    if trust_proxy:
+        xff = request.headers.get("x-forwarded-for")
+        if xff:
+            parts = [p.strip() for p in xff.split(",") if p.strip()]
+            if parts:
+                return parts[0]
+    if request.client and request.client.host:
+        return request.client.host
+    return "local"
+
+
 def reset_login_rate_limiter() -> None:
     _login_attempts.clear()
 
 
+def _prune_expired_login_attempts(now: float) -> None:
+    """Prune expired attempt timestamps and delete empty keys so the dictionary cannot grow unbounded."""
+    window_start = now - LOGIN_RATE_LIMIT_WINDOW_SECONDS
+    keys_to_remove = []
+    for k, timestamps in list(_login_attempts.items()):
+        valid = [ts for ts in timestamps if ts > window_start]
+        if valid:
+            _login_attempts[k] = valid
+        else:
+            keys_to_remove.append(k)
+    for k in keys_to_remove:
+        _login_attempts.pop(k, None)
+
+
 def _check_login_rate_limit(key: str) -> None:
     now = time.monotonic()
-    window_start = now - LOGIN_RATE_LIMIT_WINDOW_SECONDS
-    history = [ts for ts in _login_attempts.get(key, []) if ts > window_start]
+    _prune_expired_login_attempts(now)
+    history = _login_attempts.get(key, [])
     if len(history) >= LOGIN_RATE_LIMIT_MAX_ATTEMPTS:
-        _login_attempts[key] = history
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail="Too many failed login attempts. Please try again later.",
         )
-    _login_attempts[key] = history
 
 
 def _record_failed_login(key: str) -> None:
     now = time.monotonic()
-    window_start = now - LOGIN_RATE_LIMIT_WINDOW_SECONDS
-    history = [ts for ts in _login_attempts.get(key, []) if ts > window_start]
+    _prune_expired_login_attempts(now)
+    history = _login_attempts.get(key, [])
     history.append(now)
     _login_attempts[key] = history
 
@@ -485,13 +511,21 @@ def login(
     db: Session = Depends(get_db),
 ):
     raw_username = payload.username.strip()
-    tenant_slug = (x_tenant_slug or payload.tenant_slug or "aunts-lusaka").strip()
+    slug_val = x_tenant_slug or payload.tenant_slug
+    tenant_slug = slug_val.strip() if slug_val else ""
     if "/" in raw_username and not x_tenant_slug:
         tenant_slug, raw_username = raw_username.split("/", 1)
 
-    client_ip = request.client.host if request.client else "local"
+    client_ip = get_client_ip(request)
     rate_key = f"{client_ip}:{tenant_slug}:{raw_username}"
     _check_login_rate_limit(rate_key)
+
+    if not tenant_slug:
+        _record_failed_login(rate_key)
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid tenant, username, or password",
+        )
 
     tenant = db.query(Tenant).filter(Tenant.slug == tenant_slug).first()
     if not tenant or tenant.status != "active":
@@ -570,14 +604,29 @@ def refresh_tokens(
     )
 
     now = datetime.now(timezone.utc)
-    if (
-        not stored_token
-        or stored_token.revoked_at is not None
-        or stored_token.expires_at <= now
-    ):
+    if not stored_token:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Refresh token has been revoked or expired",
+            detail="Refresh token does not exist",
+        )
+
+    # REUSE DETECTION: presenting an already-revoked refresh token revokes all active refresh tokens for that user
+    if stored_token.revoked_at is not None:
+        db.query(RefreshToken).filter(
+            RefreshToken.tenant_id == tenant.id,
+            RefreshToken.user_id == user_id,
+            RefreshToken.revoked_at.is_(None),
+        ).update({"revoked_at": now}, synchronize_session=False)
+        db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Refresh token has been revoked",
+        )
+
+    if stored_token.expires_at <= now:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Refresh token has expired",
         )
 
     user = (
