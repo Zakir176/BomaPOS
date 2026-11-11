@@ -4,11 +4,29 @@ from sqlalchemy.orm import Session
 
 try:
     from .database import SessionLocal, AdminSessionLocal, bind_session_to_tenant
-    from .models import Tenant, User, MenuItem, DrinkInventory, Order, OrderItem, RefreshToken
+    from .models import (
+        Tenant,
+        User,
+        MenuItem,
+        DrinkInventory,
+        Order,
+        OrderItem,
+        RefreshToken,
+        PaymentAttempt,
+    )
     from .money import zmw_to_ngwee
 except ImportError:
     from database import SessionLocal, AdminSessionLocal, bind_session_to_tenant
-    from models import Tenant, User, MenuItem, DrinkInventory, Order, OrderItem, RefreshToken
+    from models import (
+        Tenant,
+        User,
+        MenuItem,
+        DrinkInventory,
+        Order,
+        OrderItem,
+        RefreshToken,
+        PaymentAttempt,
+    )
     from money import zmw_to_ngwee
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -100,6 +118,7 @@ def seed():
     # Use AdminSessionLocal to clear existing data across all tenants cleanly
     admin_db: Session = AdminSessionLocal()
     try:
+        admin_db.query(PaymentAttempt).delete()
         admin_db.query(OrderItem).delete()
         admin_db.query(Order).delete()
         admin_db.query(DrinkInventory).delete()
