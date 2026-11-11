@@ -24,6 +24,7 @@ from main import (
     app,
     reset_login_rate_limiter,
     reconcile_all_tenants_stuck_orders,
+    validate_cron_secret,
 )
 from database import SessionLocal, bind_session_to_tenant
 from lenco_client import (
@@ -31,9 +32,10 @@ from lenco_client import (
     compute_lenco_webhook_signature,
     mock_lenco_client,
 )
-from models import DrinkInventory, MenuItem, Order, OrderItem
+from models import DrinkInventory, MenuItem, Order, OrderItem, PaymentAttempt
 from money import ngwee_to_zmw, zmw_to_ngwee
 from seed import seed, TENANT_A_ID, TENANT_B_ID
+import pytest
 
 client = TestClient(app)
 LUSAKA_TZ = ZoneInfo("Africa/Lusaka")
@@ -620,9 +622,35 @@ def test_live_lenco_client_httpx_and_log_redaction(caplog, monkeypatch):
                     "status": True,
                     "message": "Collection initiated",
                     "data": {
+                        "id": "col-live-001",
                         "reference": ref,
                         "lencoReference": "LENCO-LIVE-001",
                         "amount": "50.00",
+                        "fee": "1.00",
+                        "bearer": "merchant",
+                        "settlementStatus": "pending",
+                        "currency": "ZMW",
+                        "status": "pay-offline",
+                    },
+                },
+            )
+        if request.method == "POST" and request.url.path.endswith("/collections/mobile-money/submit-otp"):
+            body = json.loads(request.content.decode("utf-8"))
+            assert body["otp"] == "123456"
+            assert body["id"] == "col-live-001"
+            return httpx.Response(
+                200,
+                json={
+                    "status": True,
+                    "message": "OTP verified",
+                    "data": {
+                        "id": "col-live-001",
+                        "reference": ref,
+                        "lencoReference": "LENCO-LIVE-001",
+                        "amount": "50.00",
+                        "fee": "1.00",
+                        "bearer": "merchant",
+                        "settlementStatus": "pending",
                         "currency": "ZMW",
                         "status": "pay-offline",
                     },
@@ -635,9 +663,13 @@ def test_live_lenco_client_httpx_and_log_redaction(caplog, monkeypatch):
                     "status": True,
                     "message": "Collection retrieved",
                     "data": {
+                        "id": "col-live-001",
                         "reference": ref,
                         "lencoReference": "LENCO-LIVE-001",
                         "amount": "50.00",
+                        "fee": "1.00",
+                        "bearer": "merchant",
+                        "settlementStatus": "settled",
                         "currency": "ZMW",
                         "status": "successful",
                     },
@@ -664,18 +696,430 @@ def test_live_lenco_client_httpx_and_log_redaction(caplog, monkeypatch):
             amount_ngwee=5000,
             currency="ZMW",
         )
-        assert res_collect.status == "pending"
+        assert res_collect.status == "pay-offline"
         assert res_collect.amount_ngwee == 5000
+        assert res_collect.fee_ngwee == 100
+        assert res_collect.fee_bearer == "merchant"
+        assert res_collect.settlement_status == "pending"
+
+        res_otp = live_client.submit_mobile_money_otp(
+            reference=ref,
+            otp="123456",
+            collection_id="col-live-001",
+        )
+        assert res_otp.status == "pay-offline"
 
         res_status = live_client.get_collection_by_reference(ref)
         assert res_status is not None
         assert res_status.status == "successful"
         assert res_status.amount_ngwee == 5000
+        assert res_status.fee_ngwee == 100
+        assert res_status.settlement_status == "settled"
 
     log_text = caplog.text
     assert secret_token not in log_text, "LENCO_API_TOKEN leaked into logs!"
     assert full_phone not in log_text, "Full customer phone number leaked into logs!"
     assert "***456" in log_text
+
+
+def test_stock_out_between_order_creation_and_settlement_marks_paid_and_needs_review():
+    """
+    Requirement 2 & 7:
+    Stock-out between order creation and payment settlement must never fail settlement:
+    always mark the order paid, clamp drink stock at zero, and set orders.needs_review=True
+    with a short reason (and surface it in order and dashboard responses).
+    Cash orders keep rejecting insufficient stock at creation with HTTP 400.
+    """
+    seed()
+    reset_login_rate_limiter()
+    mock_lenco_client.reset()
+
+    res_owner = client.post(
+        "/api/auth/login",
+        json={
+            "tenant_slug": "aunts-lusaka",
+            "username": "aunt",
+            "password": "owner123",
+        },
+    )
+    owner_headers = {"Authorization": f"Bearer {res_owner.json()['access_token']}"}
+    menu = client.get("/api/menu", headers=owner_headers).json()
+    drink_item = next(i for i in menu if i["category"] == "drink")
+    drink_inv_id = drink_item["drink_inventory"]["id"]
+
+    # Set stock to 3 units
+    res_patch = client.patch(
+        f"/api/inventory/drinks/{drink_inv_id}",
+        json={"stock_quantity": 3},
+        headers=owner_headers,
+    )
+    assert res_patch.status_code == 200
+
+    # 1. Create a pending mobile money order for 3 drinks (stock is 3 at creation -> allowed)
+    res_momo = client.post(
+        "/api/orders",
+        json={
+            "payment_method": "mobile_money",
+            "items": [{"menu_item_id": drink_item["id"], "quantity": 3}],
+        },
+        headers=owner_headers,
+    )
+    assert res_momo.status_code == 201
+    momo_order_id = res_momo.json()["id"]
+    assert res_momo.json()["needs_review"] is False
+
+    res_init = client.post(
+        "/api/payments/mobile-money/initiate",
+        json={"order_id": momo_order_id, "phone": "0977123456", "operator": "airtel"},
+        headers=owner_headers,
+    )
+    assert res_init.status_code == 200
+    ref = res_init.json()["lenco_reference"]
+
+    # 2. Before the mobile money payment settles, a cash order buys 2 of the 3 drinks (leaving 1 in stock)
+    res_cash = client.post(
+        "/api/orders",
+        json={
+            "payment_method": "cash",
+            "items": [{"menu_item_id": drink_item["id"], "quantity": 2}],
+        },
+        headers=owner_headers,
+    )
+    assert res_cash.status_code == 201
+
+    # Cash orders still reject insufficient stock at creation (requesting 5 when 1 left -> 400)
+    res_cash_fail = client.post(
+        "/api/orders",
+        json={
+            "payment_method": "cash",
+            "items": [{"menu_item_id": drink_item["id"], "quantity": 5}],
+        },
+        headers=owner_headers,
+    )
+    assert res_cash_fail.status_code == 400
+
+    # 3. Now verified successful payment arrives for the mobile money order (needs 3, only 1 in stock)
+    mock_lenco_client.set_collection_state(ref, status="successful")
+    res_wh = _post_signed_lenco_webhook(
+        {
+            "event": "collection.successful",
+            "data": {"reference": ref, "status": "successful"},
+        }
+    )
+    assert res_wh.status_code == 200
+    assert res_wh.json()["status"] == "success"
+    assert res_wh.json()["needs_review"] is True
+
+    # Verify payment status endpoint shows paid + needs_review=True + review_reason
+    st = client.get(f"/api/payments/status/{ref}", headers=owner_headers).json()
+    assert st["payment_status"] == "paid"
+    assert st["needs_review"] is True
+    assert drink_item["name"] in (st["review_reason"] or "")
+
+    # Verify stock is clamped at 0 (not negative)
+    inv_after = client.get("/api/inventory/drinks", headers=owner_headers).json()
+    drink_row = next(r for r in inv_after if r["menu_item_id"] == drink_item["id"])
+    assert drink_row["stock_quantity"] == 0
+
+    # Verify dashboard summary surfaces needs_review_count and needs_review_orders
+    dash = client.get("/api/dashboard/summary", headers=owner_headers).json()
+    assert dash["needs_review_count"] == 1
+    assert len(dash["needs_review_orders"]) == 1
+    assert dash["needs_review_orders"][0]["id"] == momo_order_id
+    assert dash["needs_review_orders"][0]["needs_review"] is True
+    assert drink_item["name"] in dash["needs_review_orders"][0]["review_reason"]
+
+
+def test_payment_attempts_blocking_retry_and_late_first_attempt_settlement():
+    """
+    Requirement 1, 4 & 7:
+    - Active attempt blocks creating a second attempt (HTTP 409) until the first attempt fails/expires at Lenco.
+    - Retry after first attempt fails creates a second PaymentAttempt without overwriting the first.
+    - Late payment webhook on the FIRST attempt still resolves and settles the order, recording fee, bearer,
+      and settlementStatus on the attempt.
+    """
+    seed()
+    reset_login_rate_limiter()
+    mock_lenco_client.reset()
+
+    res_owner = client.post(
+        "/api/auth/login",
+        json={
+            "tenant_slug": "aunts-lusaka",
+            "username": "aunt",
+            "password": "owner123",
+        },
+    )
+    headers = {"Authorization": f"Bearer {res_owner.json()['access_token']}"}
+    menu = client.get("/api/menu", headers=headers).json()
+    meal_item = next(i for i in menu if i["category"] == "meal")
+
+    res_order = client.post(
+        "/api/orders",
+        json={
+            "payment_method": "mobile_money",
+            "items": [{"menu_item_id": meal_item["id"], "quantity": 1}],
+        },
+        headers=headers,
+    )
+    order_id = res_order.json()["id"]
+
+    # 1. Initiate first attempt
+    init1 = client.post(
+        "/api/payments/mobile-money/initiate",
+        json={"order_id": order_id, "phone": "0977123456", "operator": "airtel"},
+        headers=headers,
+    )
+    assert init1.status_code == 200
+    ref1 = init1.json()["lenco_reference"]
+    assert init1.json()["status"] == "pay-offline"
+
+    # 2. While first attempt is still active at Lenco ('pay-offline'), initiating a second attempt is blocked
+    init_blocked = client.post(
+        "/api/payments/mobile-money/initiate",
+        json={"order_id": order_id, "phone": "0966123456", "operator": "mtn"},
+        headers=headers,
+    )
+    assert init_blocked.status_code == 409
+
+    # 3. First attempt fails at Lenco -> now a second attempt is allowed and creates a NEW row
+    mock_lenco_client.set_collection_state(ref1, status="failed")
+    init2 = client.post(
+        "/api/payments/mobile-money/initiate",
+        json={"order_id": order_id, "phone": "0966123456", "operator": "mtn"},
+        headers=headers,
+    )
+    assert init2.status_code == 200
+    ref2 = init2.json()["lenco_reference"]
+    assert ref2 != ref1
+
+    # Verify both PaymentAttempt rows exist in DB
+    db = SessionLocal()
+    bind_session_to_tenant(db, TENANT_A_ID)
+    attempts = (
+        db.query(PaymentAttempt)
+        .filter(PaymentAttempt.order_id == order_id)
+        .order_by(PaymentAttempt.id.asc())
+        .all()
+    )
+    assert len(attempts) == 2
+    assert attempts[0].reference == ref1
+    assert attempts[0].status == "failed"
+    assert attempts[1].reference == ref2
+    assert attempts[1].status == "pay-offline"
+    db.close()
+
+    # 4. Now a late successful payment arrives for the FIRST attempt (ref1)!
+    mock_lenco_client.set_collection_state(
+        ref1,
+        status="successful",
+        fee_ngwee=190,
+        fee_bearer="merchant",
+        settlement_status="settled",
+        lenco_reference="LENCO-LATE-001",
+    )
+    res_late_wh = _post_signed_lenco_webhook(
+        {
+            "event": "collection.successful",
+            "data": {"reference": ref1, "status": "successful"},
+        }
+    )
+    assert res_late_wh.status_code == 200
+    assert res_late_wh.json()["status"] == "success"
+
+    # Verify the order is settled to paid and attempt 1 recorded fee, bearer, and settlement_status
+    st1 = client.get(f"/api/payments/status/{ref1}", headers=headers).json()
+    assert st1["payment_status"] == "paid"
+
+    db = SessionLocal()
+    bind_session_to_tenant(db, TENANT_A_ID)
+    a1 = db.query(PaymentAttempt).filter(PaymentAttempt.reference == ref1).first()
+    assert a1.status == "successful"
+    assert a1.fee_ngwee == 190
+    assert a1.fee_bearer == "merchant"
+    assert a1.settlement_status == "settled"
+    assert a1.lenco_reference == "LENCO-LATE-001"
+    db.close()
+
+
+def test_otp_happy_path_with_mock():
+    """
+    Requirement 3 & 7:
+    OTP happy path with the mock:
+    - Initiate returns status='otp-required'
+    - POST /api/payments/mobile-money/submit-otp transitions to 'pay-offline' (or 'successful')
+    - Subsequent webhook / status poll completes payment to 'paid'.
+    """
+    seed()
+    reset_login_rate_limiter()
+    mock_lenco_client.reset()
+
+    res_cashier = client.post(
+        "/api/auth/login",
+        json={
+            "tenant_slug": "aunts-lusaka",
+            "username": "cashier1",
+            "password": "cashier123",
+        },
+    )
+    headers = {"Authorization": f"Bearer {res_cashier.json()['access_token']}"}
+    menu = client.get("/api/menu", headers=headers).json()
+    meal_item = next(i for i in menu if i["category"] == "meal")
+
+    res_order = client.post(
+        "/api/orders",
+        json={
+            "payment_method": "mobile_money",
+            "items": [{"menu_item_id": meal_item["id"], "quantity": 1}],
+        },
+        headers=headers,
+    )
+    order_id = res_order.json()["id"]
+
+    # Configure mock to require OTP on initiate
+    mock_lenco_client.set_next_initial_status("otp-required")
+    res_init = client.post(
+        "/api/payments/mobile-money/initiate",
+        json={"order_id": order_id, "phone": "0977120000", "operator": "airtel"},
+        headers=headers,
+    )
+    assert res_init.status_code == 200
+    assert res_init.json()["status"] == "otp-required"
+    ref = res_init.json()["lenco_reference"]
+
+    # Polling status before OTP shows distinct status 'otp-required'
+    st_otp = client.get(f"/api/payments/status/{ref}", headers=headers).json()
+    assert st_otp["payment_status"] == "pending"
+    assert st_otp["status"] == "otp-required"
+
+    # Submit OTP via POST /api/payments/mobile-money/submit-otp
+    res_otp = client.post(
+        "/api/payments/mobile-money/submit-otp",
+        json={"order_id": order_id, "otp": "123456"},
+        headers=headers,
+    )
+    assert res_otp.status_code == 200
+    assert res_otp.json()["status"] == "pay-offline"
+
+    st_offline = client.get(f"/api/payments/status/{ref}", headers=headers).json()
+    assert st_offline["status"] == "pay-offline"
+
+    # Complete approval on phone via webhook
+    mock_lenco_client.set_collection_state(ref, status="successful")
+    res_wh = _post_signed_lenco_webhook(
+        {
+            "event": "collection.successful",
+            "data": {"reference": ref, "status": "successful"},
+        }
+    )
+    assert res_wh.status_code == 200
+
+    st_final = client.get(f"/api/payments/status/{ref}", headers=headers).json()
+    assert st_final["payment_status"] == "paid"
+    assert st_final["status"] == "successful"
+
+
+def test_expiry_after_30_minutes_and_late_webhook_settles_expired_order(monkeypatch):
+    """
+    Requirement 5, 6 & 7:
+    - Orders pending > 30 minutes and confirmed not-successful at Lenco become status='expired'.
+    - Late webhooks still settle expired orders to 'paid'.
+    - POST /internal/reconcile requires X-Cron-Secret header.
+    """
+    seed()
+    reset_login_rate_limiter()
+    mock_lenco_client.reset()
+    monkeypatch.setenv("CRON_SECRET", "test-cron-secret-key-12345")
+
+    # Verify validate_cron_secret fails startup when LENCO_MODE=live and CRON_SECRET is empty
+    with pytest.raises(RuntimeError):
+        validate_cron_secret(lenco_mode="live", cron_secret="")
+
+    res_owner = client.post(
+        "/api/auth/login",
+        json={
+            "tenant_slug": "aunts-lusaka",
+            "username": "aunt",
+            "password": "owner123",
+        },
+    )
+    headers = {"Authorization": f"Bearer {res_owner.json()['access_token']}"}
+    menu = client.get("/api/menu", headers=headers).json()
+    drink_item = next(i for i in menu if i["category"] == "drink")
+    initial_stock = drink_item["drink_inventory"]["stock_quantity"]
+
+    res_order = client.post(
+        "/api/orders",
+        json={
+            "payment_method": "mobile_money",
+            "items": [{"menu_item_id": drink_item["id"], "quantity": 2}],
+        },
+        headers=headers,
+    )
+    order_id = res_order.json()["id"]
+
+    res_init = client.post(
+        "/api/payments/mobile-money/initiate",
+        json={"order_id": order_id, "phone": "0977123456", "operator": "airtel"},
+        headers=headers,
+    )
+    ref = res_init.json()["lenco_reference"]
+
+    # Backdate order and attempt to 35 minutes ago (> 30 minutes)
+    db = SessionLocal()
+    bind_session_to_tenant(db, TENANT_A_ID)
+    past_35m = datetime.now(timezone.utc) - timedelta(minutes=35)
+    order_row = db.query(Order).filter(Order.id == order_id).first()
+    order_row.created_at = past_35m
+    attempt_row = (
+        db.query(PaymentAttempt).filter(PaymentAttempt.reference == ref).first()
+    )
+    attempt_row.created_at = past_35m
+    db.commit()
+    db.close()
+
+    # 1. Verify /internal/reconcile rejects missing or wrong X-Cron-Secret
+    res_no_secret = client.post("/internal/reconcile")
+    assert res_no_secret.status_code == 401
+
+    res_bad_secret = client.post(
+        "/internal/reconcile", headers={"X-Cron-Secret": "wrong-secret"}
+    )
+    assert res_bad_secret.status_code == 401
+
+    # 2. Call /internal/reconcile with valid X-Cron-Secret while collection is still 'pay-offline' at Lenco
+    res_cron = client.post(
+        "/internal/reconcile",
+        headers={"X-Cron-Secret": "test-cron-secret-key-12345"},
+    )
+    assert res_cron.status_code == 200
+    tenant_rec = res_cron.json()["aunts-lusaka"]
+    assert tenant_rec["checked_count"] == 1
+    assert tenant_rec["expired_count"] == 1
+
+    # Verify both order and attempt are now 'expired'
+    st_exp = client.get(f"/api/payments/status/{ref}", headers=headers).json()
+    assert st_exp["payment_status"] == "expired"
+    assert st_exp["status"] == "expired"
+
+    # 3. Late webhook arrives for the expired order -> must still settle the order to 'paid' and deduct stock!
+    mock_lenco_client.set_collection_state(ref, status="successful")
+    res_late_wh = _post_signed_lenco_webhook(
+        {
+            "event": "collection.successful",
+            "data": {"reference": ref, "status": "successful"},
+        }
+    )
+    assert res_late_wh.status_code == 200
+    assert res_late_wh.json()["status"] == "success"
+
+    st_settled = client.get(f"/api/payments/status/{ref}", headers=headers).json()
+    assert st_settled["payment_status"] == "paid"
+    assert st_settled["status"] == "successful"
+
+    inv_now = client.get("/api/inventory/drinks", headers=headers).json()
+    drink_row = next(r for r in inv_now if r["menu_item_id"] == drink_item["id"])
+    assert drink_row["stock_quantity"] == initial_stock - 2
 
 
 if __name__ == "__main__":
