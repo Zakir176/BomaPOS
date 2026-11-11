@@ -3,8 +3,8 @@ import hmac
 import logging
 import os
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
-from typing import Dict, Optional
+from dataclasses import dataclass, replace
+from typing import Any, Dict, Optional
 
 import httpx
 
@@ -14,6 +14,8 @@ except ImportError:
     from money import ngwee_to_zmw, zmw_to_ngwee
 
 logger = logging.getLogger("bomapos.lenco")
+
+ACTIVE_ATTEMPT_STATUSES = ("pending", "otp-required", "pay-offline")
 
 
 def mask_phone(phone: str) -> str:
@@ -25,12 +27,28 @@ def mask_phone(phone: str) -> str:
 
 
 def _normalize_lenco_status(raw_status: str) -> str:
+    """Keep Lenco's statuses distinct: pending, otp-required, pay-offline, successful, failed, expired."""
     st = (raw_status or "").strip().lower()
     if st in ("successful", "success", "paid"):
         return "successful"
-    if st in ("failed", "declined", "cancelled", "expired"):
+    if st in ("failed", "declined", "cancelled"):
         return "failed"
+    if st == "expired":
+        return "expired"
+    if st == "otp-required":
+        return "otp-required"
+    if st == "pay-offline":
+        return "pay-offline"
     return "pending"
+
+
+def _parse_fee_ngwee(raw_fee: Any) -> Optional[int]:
+    if raw_fee is None:
+        return None
+    fee_str = str(raw_fee).strip()
+    if not fee_str:
+        return None
+    return zmw_to_ngwee(fee_str)
 
 
 def get_lenco_api_token() -> str:
@@ -75,11 +93,53 @@ def verify_lenco_webhook_signature(
 @dataclass
 class LencoCollectionResult:
     reference: str
-    status: str  # 'pending', 'successful', 'failed'
+    status: str  # 'pending', 'otp-required', 'pay-offline', 'successful', 'failed', 'expired'
     amount_ngwee: int
     currency: str = "ZMW"
     message: str = ""
     lenco_reference: Optional[str] = None
+    collection_id: Optional[str] = None
+    fee_ngwee: Optional[int] = None
+    fee_bearer: Optional[str] = None
+    settlement_status: Optional[str] = None
+
+
+def _build_collection_result_from_data(
+    data: Dict[str, Any],
+    *,
+    fallback_reference: str,
+    fallback_amount_str: str = "0",
+    fallback_currency: str = "ZMW",
+    message: str = "",
+) -> LencoCollectionResult:
+    returned_amount = data.get("amount", fallback_amount_str)
+    returned_currency = str(data.get("currency", fallback_currency)).upper()
+    returned_status = _normalize_lenco_status(data.get("status", "pending"))
+    raw_bearer = data.get("bearer")
+    raw_settlement_status = data.get("settlementStatus")
+    if raw_settlement_status is None and isinstance(data.get("settlement"), dict):
+        raw_settlement_status = data["settlement"].get("status")
+
+    return LencoCollectionResult(
+        reference=str(data.get("reference") or fallback_reference),
+        status=returned_status,
+        amount_ngwee=zmw_to_ngwee(str(returned_amount)),
+        currency=returned_currency,
+        message=message,
+        lenco_reference=(
+            str(data["lencoReference"])
+            if data.get("lencoReference") is not None
+            else None
+        ),
+        collection_id=str(data["id"]) if data.get("id") is not None else None,
+        fee_ngwee=_parse_fee_ngwee(data.get("fee")),
+        fee_bearer=str(raw_bearer).strip().lower() if raw_bearer else None,
+        settlement_status=(
+            str(raw_settlement_status).strip().lower()
+            if raw_settlement_status
+            else None
+        ),
+    )
 
 
 class LencoClient(ABC):
@@ -92,6 +152,17 @@ class LencoClient(ABC):
         operator: str,
         amount_ngwee: int,
         currency: str = "ZMW",
+    ) -> LencoCollectionResult:
+        raise NotImplementedError
+
+    @abstractmethod
+    def submit_mobile_money_otp(
+        self,
+        *,
+        reference: str,
+        otp: str,
+        collection_id: Optional[str] = None,
+        lenco_reference: Optional[str] = None,
     ) -> LencoCollectionResult:
         raise NotImplementedError
 
@@ -178,20 +249,71 @@ class LiveLencoClient(LencoClient):
                 mask_phone(phone),
                 exc.__class__.__name__,
             )
-            raise RuntimeError("Failed to initiate mobile money collection with Lenco") from exc
+            raise RuntimeError(
+                "Failed to initiate mobile money collection with Lenco"
+            ) from exc
 
         data = body.get("data") or {}
-        returned_amount = data.get("amount", amount_zmw_str)
-        returned_currency = str(data.get("currency", currency)).upper()
-        returned_status = _normalize_lenco_status(data.get("status", "pending"))
-
-        return LencoCollectionResult(
-            reference=str(data.get("reference") or reference),
-            status=returned_status,
-            amount_ngwee=zmw_to_ngwee(str(returned_amount)),
-            currency=returned_currency,
+        return _build_collection_result_from_data(
+            data,
+            fallback_reference=reference,
+            fallback_amount_str=amount_zmw_str,
+            fallback_currency=currency,
             message=str(body.get("message") or "Mobile money prompt initiated"),
-            lenco_reference=data.get("lencoReference"),
+        )
+
+    def submit_mobile_money_otp(
+        self,
+        *,
+        reference: str,
+        otp: str,
+        collection_id: Optional[str] = None,
+        lenco_reference: Optional[str] = None,
+    ) -> LencoCollectionResult:
+        resolved_id = collection_id
+        if not resolved_id:
+            existing = self.get_collection_by_reference(reference)
+            if existing and existing.collection_id:
+                resolved_id = existing.collection_id
+        if not resolved_id:
+            resolved_id = lenco_reference or reference
+
+        payload = {
+            "id": resolved_id,
+            "reference": reference,
+            "otp": otp.strip(),
+        }
+        logger.info(
+            "Submitting Lenco mobile money OTP for ref=%s id=%s",
+            reference,
+            resolved_id,
+        )
+        try:
+            with httpx.Client(
+                base_url=self._base_url, timeout=self._timeout
+            ) as client:
+                resp = client.post(
+                    "/collections/mobile-money/submit-otp",
+                    json=payload,
+                    headers=self._headers(),
+                )
+                resp.raise_for_status()
+                body = resp.json()
+        except httpx.HTTPError as exc:
+            logger.error(
+                "Lenco submit_mobile_money_otp HTTP error for ref=%s: %s",
+                reference,
+                exc.__class__.__name__,
+            )
+            raise RuntimeError(
+                "Failed to submit mobile money OTP to Lenco"
+            ) from exc
+
+        data = body.get("data") or {}
+        return _build_collection_result_from_data(
+            data,
+            fallback_reference=reference,
+            message=str(body.get("message") or "OTP submitted"),
         )
 
     def get_collection_by_reference(
@@ -222,13 +344,10 @@ class LiveLencoClient(LencoClient):
         if not data:
             return None
 
-        return LencoCollectionResult(
-            reference=str(data.get("reference") or reference),
-            status=_normalize_lenco_status(data.get("status", "pending")),
-            amount_ngwee=zmw_to_ngwee(str(data.get("amount", "0"))),
-            currency=str(data.get("currency", "ZMW")).upper(),
+        return _build_collection_result_from_data(
+            data,
+            fallback_reference=reference,
             message=str(body.get("message") or ""),
-            lenco_reference=data.get("lencoReference"),
         )
 
 
@@ -237,9 +356,23 @@ class MockLencoClient(LencoClient):
 
     def __init__(self) -> None:
         self._collections: Dict[str, LencoCollectionResult] = {}
+        self._next_initial_status: Optional[str] = None
+        self._otp_next_status: str = "pay-offline"
 
     def reset(self) -> None:
         self._collections.clear()
+        self._next_initial_status = None
+        self._otp_next_status = "pay-offline"
+
+    def set_next_initial_status(self, status: Optional[str]) -> None:
+        """Configure the status returned by the next collect_mobile_money call (e.g. 'otp-required', 'pay-offline', 'pending')."""
+        self._next_initial_status = (
+            _normalize_lenco_status(status) if status is not None else None
+        )
+
+    def set_otp_next_status(self, status: str) -> None:
+        """Configure the status returned when a valid OTP is submitted (default 'pay-offline', or 'successful')."""
+        self._otp_next_status = _normalize_lenco_status(status)
 
     def collect_mobile_money(
         self,
@@ -257,16 +390,71 @@ class MockLencoClient(LencoClient):
             mask_phone(phone),
             amount_ngwee,
         )
+        if self._next_initial_status is not None:
+            initial_status = self._next_initial_status
+            self._next_initial_status = None
+        elif phone.strip().endswith("0000"):
+            initial_status = "otp-required"
+        else:
+            initial_status = "pay-offline"
+
+        default_fee_ngwee = max(25, (amount_ngwee * 2) // 100)
+        msg = (
+            "OTP sent to customer phone"
+            if initial_status == "otp-required"
+            else "USSD push prompt simulated to customer phone"
+        )
         result = LencoCollectionResult(
             reference=reference,
-            status="pending",
+            status=initial_status,
             amount_ngwee=amount_ngwee,
             currency=currency.upper(),
-            message="USSD push prompt simulated to customer phone",
+            message=msg,
             lenco_reference=f"LENCO-SIM-{reference[:8]}",
+            collection_id=f"col-{reference}",
+            fee_ngwee=default_fee_ngwee,
+            fee_bearer="merchant",
+            settlement_status="pending",
         )
         self._collections[reference] = result
-        return result
+        return replace(result)
+
+    def submit_mobile_money_otp(
+        self,
+        *,
+        reference: str,
+        otp: str,
+        collection_id: Optional[str] = None,
+        lenco_reference: Optional[str] = None,
+    ) -> LencoCollectionResult:
+        existing = self._collections.get(reference)
+        if existing is None:
+            raise RuntimeError(f"Collection with reference '{reference}' not found")
+
+        cleaned_otp = (otp or "").strip()
+        if cleaned_otp == "000000" or not cleaned_otp:
+            new_status = "failed"
+            msg = "Invalid OTP provided"
+            settlement_st = existing.settlement_status
+        else:
+            new_status = self._otp_next_status
+            msg = (
+                "Payment successful"
+                if new_status == "successful"
+                else "OTP verified; awaiting customer authorization on phone"
+            )
+            settlement_st = (
+                "settled" if new_status == "successful" else existing.settlement_status
+            )
+
+        updated = replace(
+            existing,
+            status=new_status,
+            message=msg,
+            settlement_status=settlement_st,
+        )
+        self._collections[reference] = updated
+        return replace(updated)
 
     def get_collection_by_reference(
         self, reference: str
@@ -274,14 +462,7 @@ class MockLencoClient(LencoClient):
         item = self._collections.get(reference)
         if item is None:
             return None
-        return LencoCollectionResult(
-            reference=item.reference,
-            status=item.status,
-            amount_ngwee=item.amount_ngwee,
-            currency=item.currency,
-            message=item.message,
-            lenco_reference=item.lenco_reference,
-        )
+        return replace(item)
 
     def set_collection_state(
         self,
@@ -290,8 +471,13 @@ class MockLencoClient(LencoClient):
         status: str,
         amount_ngwee: Optional[int] = None,
         currency: Optional[str] = None,
+        fee_ngwee: Optional[int] = None,
+        fee_bearer: Optional[str] = None,
+        settlement_status: Optional[str] = None,
+        lenco_reference: Optional[str] = None,
     ) -> LencoCollectionResult:
         existing = self._collections.get(reference)
+        normalized_status = _normalize_lenco_status(status)
         resolved_amount = (
             amount_ngwee
             if amount_ngwee is not None
@@ -302,16 +488,54 @@ class MockLencoClient(LencoClient):
             if currency is not None
             else (existing.currency if existing else "ZMW")
         )
+        resolved_fee = (
+            fee_ngwee
+            if fee_ngwee is not None
+            else (
+                existing.fee_ngwee
+                if existing and existing.fee_ngwee is not None
+                else max(25, (resolved_amount * 2) // 100)
+            )
+        )
+        resolved_bearer = (
+            fee_bearer
+            if fee_bearer is not None
+            else (existing.fee_bearer if existing and existing.fee_bearer else "merchant")
+        )
+        resolved_settlement = (
+            settlement_status
+            if settlement_status is not None
+            else (
+                "settled"
+                if normalized_status == "successful"
+                else (existing.settlement_status if existing else "pending")
+            )
+        )
+        resolved_lenco_ref = (
+            lenco_reference
+            if lenco_reference is not None
+            else (
+                existing.lenco_reference
+                if existing and existing.lenco_reference
+                else f"LENCO-SIM-{reference[:8]}"
+            )
+        )
         updated = LencoCollectionResult(
             reference=reference,
-            status=_normalize_lenco_status(status),
+            status=normalized_status,
             amount_ngwee=resolved_amount,
             currency=resolved_currency,
             message=existing.message if existing else "Simulated state update",
-            lenco_reference=existing.lenco_reference if existing else f"LENCO-SIM-{reference[:8]}",
+            lenco_reference=resolved_lenco_ref,
+            collection_id=(
+                existing.collection_id if existing else f"col-{reference}"
+            ),
+            fee_ngwee=resolved_fee,
+            fee_bearer=resolved_bearer,
+            settlement_status=resolved_settlement,
         )
         self._collections[reference] = updated
-        return updated
+        return replace(updated)
 
 
 mock_lenco_client = MockLencoClient()
@@ -325,4 +549,3 @@ def get_lenco_client() -> LencoClient:
     if mode == "mock":
         return mock_lenco_client
     raise RuntimeError(f"Unsupported LENCO_MODE '{mode}'. Expected 'mock' or 'live'.")
-

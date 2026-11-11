@@ -53,11 +53,35 @@ def _enforce_tenant_criteria(execute_state):
 
     if execute_state.is_select or execute_state.is_update or execute_state.is_delete:
         try:
-            from .models import User, RefreshToken, MenuItem, DrinkInventory, Order, OrderItem
+            from .models import (
+                User,
+                RefreshToken,
+                MenuItem,
+                DrinkInventory,
+                Order,
+                OrderItem,
+                PaymentAttempt,
+            )
         except ImportError:
-            from models import User, RefreshToken, MenuItem, DrinkInventory, Order, OrderItem
+            from models import (
+                User,
+                RefreshToken,
+                MenuItem,
+                DrinkInventory,
+                Order,
+                OrderItem,
+                PaymentAttempt,
+            )
 
-        for model_cls in (User, RefreshToken, MenuItem, DrinkInventory, Order, OrderItem):
+        for model_cls in (
+            User,
+            RefreshToken,
+            MenuItem,
+            DrinkInventory,
+            Order,
+            OrderItem,
+            PaymentAttempt,
+        ):
             execute_state.statement = execute_state.statement.options(
                 with_loader_criteria(
                     model_cls,

@@ -219,8 +219,10 @@ class OrderResponse(BaseModel):
     cashier_id: int
     total_amount: float
     payment_method: Literal["cash", "mobile_money"]
-    payment_status: Literal["pending", "paid", "failed"]
+    payment_status: Literal["pending", "paid", "failed", "expired"]
     lenco_reference: Optional[str] = None
+    needs_review: bool = False
+    review_reason: Optional[str] = None
     created_at: datetime
     items: List[OrderItemResponse] = []
     model_config = ConfigDict(from_attributes=True)
@@ -240,6 +242,8 @@ class OrderResponse(BaseModel):
                 "payment_method": data.payment_method,
                 "payment_status": data.payment_status,
                 "lenco_reference": data.lenco_reference,
+                "needs_review": bool(getattr(data, "needs_review", False)),
+                "review_reason": getattr(data, "review_reason", None),
                 "created_at": data.created_at,
                 "items": getattr(data, "items", []),
             }
@@ -255,10 +259,19 @@ class MobileMoneyInitiateRequest(BaseModel):
     operator: Literal["mtn", "airtel", "zamtel"]
 
 
+class MobileMoneySubmitOtpRequest(BaseModel):
+    order_id: int
+    otp: str
+    reference: Optional[str] = None
+
+
 class MobileMoneyInitiateResponse(BaseModel):
     status: str
     message: str
     lenco_reference: str
+    reference: Optional[str] = None
+    attempt_id: Optional[int] = None
+    provider_reference: Optional[str] = None
 
 
 class LencoWebhookRequest(BaseModel):
@@ -268,14 +281,18 @@ class LencoWebhookRequest(BaseModel):
 
 class PaymentStatusResponse(BaseModel):
     order_id: int
-    payment_status: Literal["pending", "paid", "failed"]
+    payment_status: Literal["pending", "paid", "failed", "expired"]
+    status: Optional[str] = None
     lenco_reference: Optional[str] = None
+    needs_review: bool = False
+    review_reason: Optional[str] = None
 
 
 class ReconciliationResponse(BaseModel):
     checked_count: int
     settled_paid_count: int
     settled_failed_count: int
+    expired_count: int = 0
     still_pending_count: int
 
 
@@ -288,6 +305,8 @@ class DashboardSummaryResponse(BaseModel):
     settlement_account_balance_zmw: float
     today_orders_count: int
     low_stock_alerts: List[DrinkInventoryWithItemResponse]
+    needs_review_count: int = 0
+    needs_review_orders: List[OrderResponse] = []
 
     @model_validator(mode="before")
     @classmethod

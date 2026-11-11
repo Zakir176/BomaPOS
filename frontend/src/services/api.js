@@ -168,6 +168,12 @@ export const api = {
       body: JSON.stringify({ order_id: orderId, phone, operator }),
     }),
 
+  submitMobileMoneyOtp: (orderId, otp, reference = null) =>
+    request('/api/payments/mobile-money/submit-otp', {
+      method: 'POST',
+      body: JSON.stringify({ order_id: orderId, otp, reference }),
+    }),
+
   pollPaymentStatus: (lencoReference) =>
     request(`/api/payments/status/${lencoReference}`),
 
