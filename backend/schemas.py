@@ -13,7 +13,7 @@ except ImportError:
 # Auth Schemas
 # ---------------------------------------------------------
 class LoginRequest(BaseModel):
-    tenant_slug: str = "aunts-lusaka"
+    tenant_slug: Optional[str] = None
     username: str
     password: str
 
