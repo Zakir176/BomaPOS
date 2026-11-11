@@ -24,6 +24,7 @@ from fastapi.testclient import TestClient
 from main import (
     app,
     reset_login_rate_limiter,
+    reconcile_tenant_pending_orders,
     reconcile_all_tenants_stuck_orders,
     validate_cron_secret,
     validate_startup_config,
@@ -31,11 +32,13 @@ from main import (
 from database import SessionLocal, bind_session_to_tenant
 from lenco_client import (
     LiveLencoClient,
+    LencoRejectedError,
+    LencoUnavailableError,
     compute_lenco_webhook_signature,
     mock_lenco_client,
     format_zambian_phone,
 )
-from models import DrinkInventory, MenuItem, Order, OrderItem, PaymentAttempt
+from models import DrinkInventory, MenuItem, Order, OrderItem, PaymentAttempt, User
 from money import ngwee_to_zmw, zmw_to_ngwee
 from seed import seed, TENANT_A_ID, TENANT_B_ID
 import pytest
@@ -1491,6 +1494,271 @@ def test_abandon_payment_attempt_and_reconciliation():
     att1 = db.query(PaymentAttempt).filter(PaymentAttempt.reference == ref1).first()
     assert att1.status == "successful"
     db.close()
+
+
+def test_reconcile_candidate_window_500_old_expired():
+    seed()
+    db = SessionLocal()
+    bind_session_to_tenant(db, TENANT_A_ID)
+
+    # Create an order
+    user = db.query(User).filter(User.tenant_id == TENANT_A_ID).first()
+    order = Order(
+        tenant_id=TENANT_A_ID,
+        cashier_id=user.id,
+        total_ngwee=5000,
+        payment_method="mobile_money",
+        payment_status="expired",
+    )
+    db.add(order)
+    db.flush()
+
+    # Create 500 expired attempts older than 48 hours (e.g. 50 hours ago)
+    past_50h = datetime.now(timezone.utc) - timedelta(hours=50)
+    attempts_to_add = [
+        PaymentAttempt(
+            tenant_id=TENANT_A_ID,
+            order_id=order.id,
+            reference=f"old-exp-{i}-{uuid.uuid4()}",
+            status="expired",
+            created_at=past_50h,
+            updated_at=past_50h,
+        )
+        for i in range(500)
+    ]
+    db.bulk_save_objects(attempts_to_add)
+    db.commit()
+
+    # Instrument get_collection_by_reference to track calls
+    calls = []
+    orig_get = mock_lenco_client.get_collection_by_reference
+
+    def tracked_get(ref):
+        calls.append(ref)
+        return orig_get(ref)
+
+    mock_lenco_client.get_collection_by_reference = tracked_get
+    try:
+        res = reconcile_tenant_pending_orders(
+            db=db,
+            tenant_id=TENANT_A_ID,
+            lenco_client=mock_lenco_client,
+            older_than_minutes=10,
+        )
+        # The 500 attempts older than 48h must NOT be polled!
+        assert res.checked_count == 0
+        assert len(calls) == 0
+    finally:
+        mock_lenco_client.get_collection_by_reference = orig_get
+        db.close()
+
+
+def test_paid_order_expires_older_active_attempts():
+    seed()
+    res_cashier = client.post(
+        "/api/auth/login",
+        json={"tenant_slug": "aunts-lusaka", "username": "cashier1", "password": "cashier123"},
+    )
+    headers = {"Authorization": f"Bearer {res_cashier.json()['access_token']}"}
+
+    res_menu = client.get("/api/menu", headers=headers).json()
+    item = res_menu[0]
+
+    # Create order
+    res_order = client.post(
+        "/api/orders",
+        json={"payment_method": "mobile_money", "items": [{"menu_item_id": item["id"], "quantity": 1}]},
+        headers=headers,
+    )
+    order_id = res_order.json()["id"]
+
+    # Create an old active attempt (e.g. pending, 35 minutes ago > PAYMENT_ATTEMPT_EXPIRY_MINUTES)
+    db = SessionLocal()
+    bind_session_to_tenant(db, TENANT_A_ID)
+    past_35m = datetime.now(timezone.utc) - timedelta(minutes=35)
+    old_att_ref = str(uuid.uuid4())
+    old_att = PaymentAttempt(
+        tenant_id=TENANT_A_ID,
+        order_id=order_id,
+        reference=old_att_ref,
+        status="pending",
+        created_at=past_35m,
+        updated_at=past_35m,
+    )
+    db.add(old_att)
+    db.commit()
+    db.close()
+
+    # Initiate a fresh attempt
+    res_init = client.post(
+        "/api/payments/mobile-money/initiate",
+        json={"order_id": order_id, "phone": "0977123456", "operator": "airtel"},
+        headers=headers,
+    )
+    assert res_init.status_code == 200
+    new_ref = res_init.json()["lenco_reference"]
+
+    # Settle new attempt via webhook -> order is marked paid
+    mock_lenco_client.set_collection_state(new_ref, status="successful")
+    res_wh = _post_signed_lenco_webhook(
+        {"event": "collection.successful", "data": {"reference": new_ref, "status": "successful"}}
+    )
+    assert res_wh.status_code == 200
+
+    # Verify the old attempt was moved to 'expired' so it stops being polled
+    db = SessionLocal()
+    bind_session_to_tenant(db, TENANT_A_ID)
+    old_att_db = db.query(PaymentAttempt).filter(PaymentAttempt.reference == old_att_ref).first()
+    assert old_att_db.status == "expired"
+    db.close()
+
+
+def test_failure_isolation_per_attempt_and_cross_tenant():
+    seed()
+    res_cashier = client.post(
+        "/api/auth/login",
+        json={"tenant_slug": "aunts-lusaka", "username": "cashier1", "password": "cashier123"},
+    )
+    headers = {"Authorization": f"Bearer {res_cashier.json()['access_token']}"}
+
+    res_menu = client.get("/api/menu", headers=headers).json()
+    item = res_menu[0]
+
+    # Create 2 orders
+    o1 = client.post(
+        "/api/orders",
+        json={"payment_method": "mobile_money", "items": [{"menu_item_id": item["id"], "quantity": 1}]},
+        headers=headers,
+    ).json()["id"]
+
+    o2 = client.post(
+        "/api/orders",
+        json={"payment_method": "mobile_money", "items": [{"menu_item_id": item["id"], "quantity": 1}]},
+        headers=headers,
+    ).json()["id"]
+
+    # Initiate both
+    ref1 = client.post(
+        "/api/payments/mobile-money/initiate",
+        json={"order_id": o1, "phone": "0977123456", "operator": "airtel"},
+        headers=headers,
+    ).json()["lenco_reference"]
+
+    ref2 = client.post(
+        "/api/payments/mobile-money/initiate",
+        json={"order_id": o2, "phone": "0977123456", "operator": "airtel"},
+        headers=headers,
+    ).json()["lenco_reference"]
+
+    # Backdate both to 15 minutes ago
+    db = SessionLocal()
+    bind_session_to_tenant(db, TENANT_A_ID)
+    past_15m = datetime.now(timezone.utc) - timedelta(minutes=15)
+    for r in [ref1, ref2]:
+        att = db.query(PaymentAttempt).filter(PaymentAttempt.reference == r).first()
+        att.created_at = past_15m
+        order_obj = db.query(Order).filter(Order.id == att.order_id).first()
+        order_obj.created_at = past_15m
+    db.commit()
+    db.close()
+
+    # Configure ref1 to raise RuntimeError in Lenco client
+    mock_lenco_client.set_reference_error(ref1, RuntimeError("Temporary provider glitch"))
+    # Configure ref2 to succeed at Lenco
+    mock_lenco_client.set_collection_state(ref2, status="successful")
+
+    # Reconcile: ref1 failure must NOT prevent ref2 from settling!
+    res_rec = client.post("/internal/reconcile", headers={"X-Cron-Secret": "test-cron-secret-key-12345"})
+    assert res_rec.status_code == 200
+    rec_data = res_rec.json()["aunts-lusaka"]
+    assert rec_data["checked_count"] == 2
+    assert rec_data["settled_paid_count"] == 1  # ref2 settled!
+    assert rec_data["error_count"] == 1  # ref1 counted in error_count
+    assert rec_data["still_pending_count"] >= 1  # ref1 counted in still_pending
+
+    # Verify ref2 is paid and ref1 is still pending
+    st2 = client.get(f"/api/payments/status/{ref2}", headers=headers).json()
+    assert st2["payment_status"] == "paid"
+    st1 = client.get(f"/api/payments/status/{ref1}", headers=headers).json()
+    assert st1["payment_status"] == "pending"
+
+
+def test_error_classification_rejected_vs_unavailable():
+    seed()
+    res_cashier = client.post(
+        "/api/auth/login",
+        json={"tenant_slug": "aunts-lusaka", "username": "cashier1", "password": "cashier123"},
+    )
+    headers = {"Authorization": f"Bearer {res_cashier.json()['access_token']}"}
+
+    res_menu = client.get("/api/menu", headers=headers).json()
+    item = res_menu[0]
+
+    # --- Test A: LencoRejectedError ---
+    o1 = client.post(
+        "/api/orders",
+        json={"payment_method": "mobile_money", "items": [{"menu_item_id": item["id"], "quantity": 1}]},
+        headers=headers,
+    ).json()["id"]
+
+    mock_lenco_client.set_next_error(LencoRejectedError("Phone number not registered on Airtel Money"))
+    res_rej = client.post(
+        "/api/payments/mobile-money/initiate",
+        json={"order_id": o1, "phone": "0977123456", "operator": "airtel"},
+        headers=headers,
+    )
+    assert res_rej.status_code == 400
+    assert "Phone number not registered on Airtel Money" in res_rej.json()["detail"]
+
+    # Verify attempt is 'failed' and order is 'failed'
+    db = SessionLocal()
+    bind_session_to_tenant(db, TENANT_A_ID)
+    att_rej = db.query(PaymentAttempt).filter(PaymentAttempt.order_id == o1).first()
+    assert att_rej.status == "failed"
+    ord_rej = db.query(Order).filter(Order.id == o1).first()
+    assert ord_rej.payment_status == "failed"
+    db.close()
+
+    # A rejected attempt does NOT block an immediate retry!
+    res_retry = client.post(
+        "/api/payments/mobile-money/initiate",
+        json={"order_id": o1, "phone": "0961234567", "operator": "mtn"},
+        headers=headers,
+    )
+    assert res_retry.status_code == 200
+    assert res_retry.json()["status"] in ("pay-offline", "pending", "otp-required")
+
+    # --- Test B: LencoUnavailableError ---
+    o2 = client.post(
+        "/api/orders",
+        json={"payment_method": "mobile_money", "items": [{"menu_item_id": item["id"], "quantity": 1}]},
+        headers=headers,
+    ).json()["id"]
+
+    mock_lenco_client.set_next_error(LencoUnavailableError("Payment provider gateway timed out"))
+    res_unav = client.post(
+        "/api/payments/mobile-money/initiate",
+        json={"order_id": o2, "phone": "0977123456", "operator": "airtel"},
+        headers=headers,
+    )
+    assert res_unav.status_code == 502
+    assert "Payment provider timed out or returned an error" in res_unav.json()["detail"]
+
+    # Attempt is left 'initiating'
+    db = SessionLocal()
+    bind_session_to_tenant(db, TENANT_A_ID)
+    att_unav = db.query(PaymentAttempt).filter(PaymentAttempt.order_id == o2).first()
+    assert att_unav.status == "initiating"
+    db.close()
+
+    # Immediate retry is blocked with 409
+    res_block = client.post(
+        "/api/payments/mobile-money/initiate",
+        json={"order_id": o2, "phone": "0977123456", "operator": "airtel"},
+        headers=headers,
+    )
+    assert res_block.status_code == 409
+    assert "already in progress" in res_block.json()["detail"]
 
 
 if __name__ == "__main__":
