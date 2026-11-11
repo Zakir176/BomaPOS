@@ -174,8 +174,10 @@ class Order(Base):
     payment_method = Column(String, nullable=False)  # 'cash' or 'mobile_money'
     payment_status = Column(
         String, default="pending", nullable=False
-    )  # 'pending', 'paid', 'failed'
+    )  # 'pending', 'paid', 'failed', 'expired'
     lenco_reference = Column(String, unique=True, index=True, nullable=True)
+    needs_review = Column(Boolean, default=False, nullable=False)
+    review_reason = Column(String, nullable=True)
     created_at = Column(DateTime(timezone=True), default=utc_now, nullable=False)
 
     __table_args__ = (
@@ -200,6 +202,51 @@ class Order(Base):
         primaryjoin="and_(Order.id == OrderItem.order_id, Order.tenant_id == OrderItem.tenant_id)",
         foreign_keys="[OrderItem.order_id, OrderItem.tenant_id]",
         overlaps="order_items,menu_item",
+    )
+    payment_attempts = relationship(
+        "PaymentAttempt",
+        back_populates="order",
+        cascade="all, delete-orphan",
+        primaryjoin="and_(Order.id == PaymentAttempt.order_id, Order.tenant_id == PaymentAttempt.tenant_id)",
+        foreign_keys="[PaymentAttempt.order_id, PaymentAttempt.tenant_id]",
+        order_by="PaymentAttempt.id.asc()",
+    )
+
+
+class PaymentAttempt(Base):
+    __tablename__ = "payment_attempts"
+
+    id = Column(Integer, primary_key=True, index=True)
+    tenant_id = Column(
+        Uuid(as_uuid=True), ForeignKey("tenants.id"), nullable=False, index=True
+    )
+    order_id = Column(Integer, nullable=False, index=True)
+    reference = Column(String, unique=True, index=True, nullable=False)
+    lenco_reference = Column(String, index=True, nullable=True)
+    status = Column(
+        String, default="pending", nullable=False
+    )  # 'pending', 'otp-required', 'pay-offline', 'successful', 'failed', 'expired'
+    fee_ngwee = Column(BigInteger, nullable=True)
+    fee_bearer = Column(String, nullable=True)
+    settlement_status = Column(String, nullable=True)
+    created_at = Column(DateTime(timezone=True), default=utc_now, nullable=False)
+    updated_at = Column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
+    )
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["order_id", "tenant_id"],
+            ["orders.id", "orders.tenant_id"],
+            name="fk_payment_attempts_order_tenant",
+        ),
+    )
+
+    order = relationship(
+        "Order",
+        back_populates="payment_attempts",
+        primaryjoin="and_(PaymentAttempt.order_id == Order.id, PaymentAttempt.tenant_id == Order.tenant_id)",
+        foreign_keys="[PaymentAttempt.order_id, PaymentAttempt.tenant_id]",
     )
 
 
