@@ -17,6 +17,7 @@ if "TEST_DATABASE_URL" in os.environ:
     os.environ["DATABASE_URL"] = os.environ["TEST_DATABASE_URL"]
 if "TEST_ADMIN_DATABASE_URL" in os.environ:
     os.environ["ADMIN_DATABASE_URL"] = os.environ["TEST_ADMIN_DATABASE_URL"]
+os.environ["CRON_SECRET"] = "test-cron-secret-key-12345"
 
 import httpx
 from fastapi.testclient import TestClient
@@ -25,12 +26,14 @@ from main import (
     reset_login_rate_limiter,
     reconcile_all_tenants_stuck_orders,
     validate_cron_secret,
+    validate_startup_config,
 )
 from database import SessionLocal, bind_session_to_tenant
 from lenco_client import (
     LiveLencoClient,
     compute_lenco_webhook_signature,
     mock_lenco_client,
+    format_zambian_phone,
 )
 from models import DrinkInventory, MenuItem, Order, OrderItem, PaymentAttempt
 from money import ngwee_to_zmw, zmw_to_ngwee
@@ -567,11 +570,14 @@ def test_stuck_pending_orders_reconciliation():
     )
     recent_ref = init2.json()["lenco_reference"]
 
-    # Backdate old_order_id to 15 minutes ago
+    # Backdate old_order_id and its attempt to 15 minutes ago
     db = SessionLocal()
     bind_session_to_tenant(db, TENANT_A_ID)
     old_order = db.query(Order).filter(Order.id == old_order_id).first()
     old_order.created_at = datetime.now(timezone.utc) - timedelta(minutes=15)
+    old_att = db.query(PaymentAttempt).filter(PaymentAttempt.order_id == old_order_id).first()
+    if old_att:
+        old_att.created_at = datetime.now(timezone.utc) - timedelta(minutes=15)
     db.commit()
     db.close()
 
@@ -1120,6 +1126,371 @@ def test_expiry_after_30_minutes_and_late_webhook_settles_expired_order(monkeypa
     inv_now = client.get("/api/inventory/drinks", headers=headers).json()
     drink_row = next(r for r in inv_now if r["menu_item_id"] == drink_item["id"])
     assert drink_row["stock_quantity"] == initial_stock - 2
+
+
+def test_zambian_phone_formatting():
+    from fastapi import HTTPException
+
+    # Local mode (default)
+    assert format_zambian_phone("0977123456", format_type="local") == "0977123456"
+    assert format_zambian_phone("+260977123456", format_type="local") == "0977123456"
+    assert format_zambian_phone("260977123456", format_type="local") == "0977123456"
+    assert format_zambian_phone("096-123-4567", format_type="local") == "0961234567"
+    assert format_zambian_phone("095 123 4567", format_type="local") == "0951234567"
+    assert format_zambian_phone("0771234567", format_type="local") == "0771234567"
+    assert format_zambian_phone("0761234567", format_type="local") == "0761234567"
+    assert format_zambian_phone("0751234567", format_type="local") == "0751234567"
+
+    # International mode
+    assert format_zambian_phone("0977123456", format_type="international") == "260977123456"
+    assert format_zambian_phone("+260961234567", format_type="international") == "260961234567"
+
+    # Invalid numbers
+    for invalid in ["123456", "0981234567", "0941234567", "", "+123456789012"]:
+        with pytest.raises(HTTPException) as exc_info:
+            format_zambian_phone(invalid)
+        assert exc_info.value.status_code == 400
+
+
+def test_startup_validation_live_mode():
+    # In live mode, both LENCO_API_TOKEN and CRON_SECRET are required
+    with pytest.raises(RuntimeError, match="LENCO_API_TOKEN"):
+        validate_startup_config("live", lenco_api_token="", cron_secret="secret123")
+
+    with pytest.raises(RuntimeError, match="CRON_SECRET"):
+        validate_startup_config("live", lenco_api_token="token123", cron_secret="")
+
+    # Should succeed when both are provided
+    validate_startup_config("live", lenco_api_token="token123", cron_secret="secret123")
+
+    # In mock mode, missing tokens should not raise
+    validate_startup_config("mock", lenco_api_token="", cron_secret="")
+
+
+def test_write_ahead_attempt_and_timeout():
+    seed()
+    res_cashier = client.post(
+        "/api/auth/login",
+        json={"tenant_slug": "aunts-lusaka", "username": "cashier1", "password": "cashier123"},
+    )
+    headers = {"Authorization": f"Bearer {res_cashier.json()['access_token']}"}
+
+    res_menu = client.get("/api/menu", headers=headers).json()
+    item = res_menu[0]
+
+    # Create order
+    res_order = client.post(
+        "/api/orders",
+        json={"payment_method": "mobile_money", "items": [{"menu_item_id": item["id"], "quantity": 1}]},
+        headers=headers,
+    )
+    order_id = res_order.json()["id"]
+
+    # Simulate Lenco timeout or exception during collect_mobile_money
+    orig_collect = mock_lenco_client.collect_mobile_money
+
+    def timeout_collect(**kwargs):
+        raise httpx.ConnectTimeout("Connection timed out to Lenco gateway")
+
+    mock_lenco_client.collect_mobile_money = timeout_collect
+
+    try:
+        res_init = client.post(
+            "/api/payments/mobile-money/initiate",
+            json={"order_id": order_id, "phone": "0977123456", "operator": "airtel"},
+            headers=headers,
+        )
+        assert res_init.status_code == 502
+        assert "Payment provider timed out or returned an error" in res_init.json()["detail"]
+    finally:
+        mock_lenco_client.collect_mobile_money = orig_collect
+
+    # Check that attempt was committed with status 'initiating' (write-ahead commit)
+    db = SessionLocal()
+    bind_session_to_tenant(db, TENANT_A_ID)
+    attempt = db.query(PaymentAttempt).filter(PaymentAttempt.order_id == order_id).first()
+    assert attempt is not None
+    assert attempt.status == "initiating"
+
+    # Immediately trying to initiate again returns 409 Conflict
+    res_retry = client.post(
+        "/api/payments/mobile-money/initiate",
+        json={"order_id": order_id, "phone": "0977123456", "operator": "airtel"},
+        headers=headers,
+    )
+    assert res_retry.status_code == 409
+    assert "already in progress" in res_retry.json()["detail"]
+
+    # Reconciliation handles 'initiating' attempt older than 2 minutes:
+    # If Lenco has no record (mock returns None), marks attempt 'failed' and order 'failed'
+    attempt.created_at = datetime.now(timezone.utc) - timedelta(minutes=3)
+    attempt_ref = attempt.reference
+    db.commit()
+    db.close()
+
+    res_rec = client.post("/internal/reconcile", headers={"X-Cron-Secret": "test-cron-secret-key-12345"})
+    assert res_rec.status_code == 200
+    assert res_rec.json()["aunts-lusaka"]["settled_failed_count"] >= 1
+
+    # Status check confirms failed
+    res_st = client.get(f"/api/payments/status/{attempt_ref}", headers=headers).json()
+    assert res_st["payment_status"] == "failed"
+    assert res_st["status"] == "failed"
+
+
+def test_order_age_vs_attempt_age_expiry():
+    seed()
+    res_cashier = client.post(
+        "/api/auth/login",
+        json={"tenant_slug": "aunts-lusaka", "username": "cashier1", "password": "cashier123"},
+    )
+    headers = {"Authorization": f"Bearer {res_cashier.json()['access_token']}"}
+
+    res_menu = client.get("/api/menu", headers=headers).json()
+    item = res_menu[0]
+
+    # Create order
+    res_order = client.post(
+        "/api/orders",
+        json={"payment_method": "mobile_money", "items": [{"menu_item_id": item["id"], "quantity": 1}]},
+        headers=headers,
+    )
+    order_id = res_order.json()["id"]
+
+    # Initiate attempt (attempt is fresh, e.g. now)
+    res_init = client.post(
+        "/api/payments/mobile-money/initiate",
+        json={"order_id": order_id, "phone": "0977123456", "operator": "airtel"},
+        headers=headers,
+    )
+    assert res_init.status_code == 200
+    ref = res_init.json()["lenco_reference"]
+
+    # Backdate ORDER to 45 minutes ago (> 30 min expiry), but keep ATTEMPT fresh (5 minutes ago)
+    db = SessionLocal()
+    bind_session_to_tenant(db, TENANT_A_ID)
+    order_row = db.query(Order).filter(Order.id == order_id).first()
+    order_row.created_at = datetime.now(timezone.utc) - timedelta(minutes=45)
+    attempt_row = db.query(PaymentAttempt).filter(PaymentAttempt.reference == ref).first()
+    attempt_row.created_at = datetime.now(timezone.utc) - timedelta(minutes=5)
+    db.commit()
+    db.close()
+
+    # Second initiate must NOT expire the fresh attempt and must return 409 Conflict
+    res_second = client.post(
+        "/api/payments/mobile-money/initiate",
+        json={"order_id": order_id, "phone": "0977123456", "operator": "airtel"},
+        headers=headers,
+    )
+    assert res_second.status_code == 409
+    assert "already in progress" in res_second.json()["detail"]
+
+
+def test_duplicate_payment_detection_webhook_otp_reconcile():
+    seed()
+    res_cashier = client.post(
+        "/api/auth/login",
+        json={"tenant_slug": "aunts-lusaka", "username": "cashier1", "password": "cashier123"},
+    )
+    headers = {"Authorization": f"Bearer {res_cashier.json()['access_token']}"}
+
+    db = SessionLocal()
+    bind_session_to_tenant(db, TENANT_A_ID)
+    drink = db.query(MenuItem).filter(MenuItem.category == "drink").first()
+    drink_id = drink.id
+    inv_before = db.query(DrinkInventory).filter(DrinkInventory.menu_item_id == drink_id).first()
+    initial_stock = inv_before.stock_quantity
+    db.close()
+
+    # 1. Create order for 1 drink
+    res_order = client.post(
+        "/api/orders",
+        json={"payment_method": "mobile_money", "items": [{"menu_item_id": drink_id, "quantity": 1}]},
+        headers=headers,
+    )
+    order_id = res_order.json()["id"]
+
+    # Initiate attempt A
+    res_init_a = client.post(
+        "/api/payments/mobile-money/initiate",
+        json={"order_id": order_id, "phone": "0977123456", "operator": "airtel"},
+        headers=headers,
+    )
+    ref_a = res_init_a.json()["lenco_reference"]
+
+    # Settle attempt A via webhook -> order is marked paid and stock is decremented by 1
+    mock_lenco_client.set_collection_state(ref_a, status="successful")
+    res_wh_a = _post_signed_lenco_webhook(
+        {"event": "collection.successful", "data": {"reference": ref_a, "status": "successful"}}
+    )
+    assert res_wh_a.status_code == 200
+    assert res_wh_a.json()["status"] == "success"
+
+    db = SessionLocal()
+    bind_session_to_tenant(db, TENANT_A_ID)
+    order_row = db.query(Order).filter(Order.id == order_id).first()
+    assert order_row.payment_status == "paid"
+    assert order_row.needs_review is False
+    order_total_ngwee = order_row.total_ngwee
+    inv = db.query(DrinkInventory).filter(DrinkInventory.menu_item_id == drink_id).first()
+    assert inv.stock_quantity == initial_stock - 1
+
+    # 2. Duplicate payment via WEBHOOK on attempt B
+    attempt_b_ref = str(uuid.uuid4())
+    attempt_b = PaymentAttempt(
+        tenant_id=TENANT_A_ID,
+        order_id=order_id,
+        reference=attempt_b_ref,
+        status="pending",
+        created_at=datetime.now(timezone.utc) - timedelta(minutes=5),
+        updated_at=datetime.now(timezone.utc) - timedelta(minutes=5),
+    )
+    db.add(attempt_b)
+    db.commit()
+    db.close()
+
+    mock_lenco_client.set_collection_state(attempt_b_ref, status="successful", amount_ngwee=order_total_ngwee)
+    res_wh_b = _post_signed_lenco_webhook(
+        {"event": "collection.successful", "data": {"reference": attempt_b_ref, "status": "successful"}}
+    )
+    assert res_wh_b.status_code == 200
+
+    # Verify duplicate payment detected: needs_review is True, review_reason appended, stock NOT double-decremented
+    db = SessionLocal()
+    bind_session_to_tenant(db, TENANT_A_ID)
+    order_row = db.query(Order).filter(Order.id == order_id).first()
+    assert order_row.needs_review is True
+    assert f"Duplicate payment on attempt {attempt_b_ref}: refund required" in order_row.review_reason
+    inv = db.query(DrinkInventory).filter(DrinkInventory.menu_item_id == drink_id).first()
+    assert inv.stock_quantity == initial_stock - 1  # Never double decremented!
+
+    # 3. Duplicate payment via OTP on attempt C
+    attempt_c_ref = str(uuid.uuid4())
+    attempt_c = PaymentAttempt(
+        tenant_id=TENANT_A_ID,
+        order_id=order_id,
+        reference=attempt_c_ref,
+        status="otp-required",
+        created_at=datetime.now(timezone.utc) - timedelta(minutes=2),
+        updated_at=datetime.now(timezone.utc) - timedelta(minutes=2),
+    )
+    db.add(attempt_c)
+    db.commit()
+    db.close()
+
+    mock_lenco_client.set_collection_state(attempt_c_ref, status="otp-required", amount_ngwee=order_total_ngwee)
+    mock_lenco_client.set_otp_next_status("successful")
+    res_otp = client.post(
+        "/api/payments/mobile-money/submit-otp",
+        json={"order_id": order_id, "otp": "123456", "reference": attempt_c_ref},
+        headers=headers,
+    )
+    assert res_otp.status_code == 200
+
+    db = SessionLocal()
+    bind_session_to_tenant(db, TENANT_A_ID)
+    order_row = db.query(Order).filter(Order.id == order_id).first()
+    assert f"Duplicate payment on attempt {attempt_c_ref}: refund required" in order_row.review_reason
+    inv = db.query(DrinkInventory).filter(DrinkInventory.menu_item_id == drink_id).first()
+    assert inv.stock_quantity == initial_stock - 1  # Still not double decremented!
+
+    # 4. Duplicate payment via RECONCILIATION on attempt D
+    attempt_d_ref = str(uuid.uuid4())
+    past_15m = datetime.now(timezone.utc) - timedelta(minutes=15)
+    attempt_d = PaymentAttempt(
+        tenant_id=TENANT_A_ID,
+        order_id=order_id,
+        reference=attempt_d_ref,
+        status="pending",
+        created_at=past_15m,
+        updated_at=past_15m,
+    )
+    db.add(attempt_d)
+    db.commit()
+    db.close()
+
+    mock_lenco_client.set_collection_state(attempt_d_ref, status="successful", amount_ngwee=order_total_ngwee)
+    res_cron = client.post("/internal/reconcile", headers={"X-Cron-Secret": "test-cron-secret-key-12345"})
+    assert res_cron.status_code == 200
+
+    db = SessionLocal()
+    bind_session_to_tenant(db, TENANT_A_ID)
+    order_row = db.query(Order).filter(Order.id == order_id).first()
+    assert f"Duplicate payment on attempt {attempt_d_ref}: refund required" in order_row.review_reason
+    inv = db.query(DrinkInventory).filter(DrinkInventory.menu_item_id == drink_id).first()
+    assert inv.stock_quantity == initial_stock - 1  # Never double decremented!
+    db.close()
+
+
+def test_abandon_payment_attempt_and_reconciliation():
+    seed()
+    res_cashier = client.post(
+        "/api/auth/login",
+        json={"tenant_slug": "aunts-lusaka", "username": "cashier1", "password": "cashier123"},
+    )
+    headers = {"Authorization": f"Bearer {res_cashier.json()['access_token']}"}
+
+    res_menu = client.get("/api/menu", headers=headers).json()
+    item = res_menu[0]
+
+    # Create order
+    res_order = client.post(
+        "/api/orders",
+        json={"payment_method": "mobile_money", "items": [{"menu_item_id": item["id"], "quantity": 1}]},
+        headers=headers,
+    )
+    order_id = res_order.json()["id"]
+
+    # Initiate attempt 1
+    res_init1 = client.post(
+        "/api/payments/mobile-money/initiate",
+        json={"order_id": order_id, "phone": "0977123456", "operator": "airtel"},
+        headers=headers,
+    )
+    assert res_init1.status_code == 200
+    ref1 = res_init1.json()["lenco_reference"]
+
+    # Calling initiate again immediately fails with 409
+    res_fail = client.post(
+        "/api/payments/mobile-money/initiate",
+        json={"order_id": order_id, "phone": "0977123456", "operator": "airtel"},
+        headers=headers,
+    )
+    assert res_fail.status_code == 409
+
+    # Cashier clicks "Change number / retry" -> calls abandon endpoint
+    res_abandon = client.post(
+        "/api/payments/mobile-money/abandon",
+        json={"order_id": order_id, "reference": ref1},
+        headers=headers,
+    )
+    assert res_abandon.status_code == 200
+    assert res_abandon.json()["status"] == "abandoned"
+
+    # Now cashier can immediately initiate attempt 2 on a new number!
+    res_init2 = client.post(
+        "/api/payments/mobile-money/initiate",
+        json={"order_id": order_id, "phone": "0961234567", "operator": "mtn"},
+        headers=headers,
+    )
+    assert res_init2.status_code == 200
+    ref2 = res_init2.json()["lenco_reference"]
+    assert ref2 != ref1
+
+    # Reconciliation queries abandoned attempt within 60 minutes:
+    # If customer actually approved attempt 1 late at Lenco, reconcile will settle it or flag duplicate!
+    order_total_ngwee = zmw_to_ngwee(str(res_order.json()["total_amount"]))
+    mock_lenco_client.set_collection_state(ref1, status="successful", amount_ngwee=order_total_ngwee)
+    res_rec = client.post("/internal/reconcile", headers={"X-Cron-Secret": "test-cron-secret-key-12345"})
+    assert res_rec.status_code == 200
+
+    db = SessionLocal()
+    bind_session_to_tenant(db, TENANT_A_ID)
+    order_row = db.query(Order).filter(Order.id == order_id).first()
+    assert order_row.payment_status == "paid"
+    att1 = db.query(PaymentAttempt).filter(PaymentAttempt.reference == ref1).first()
+    assert att1.status == "successful"
+    db.close()
 
 
 if __name__ == "__main__":
