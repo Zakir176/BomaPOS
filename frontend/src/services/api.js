@@ -174,6 +174,12 @@ export const api = {
       body: JSON.stringify({ order_id: orderId, otp, reference }),
     }),
 
+  abandonMobileMoney: (orderId, reference) =>
+    request('/api/payments/mobile-money/abandon', {
+      method: 'POST',
+      body: JSON.stringify({ order_id: orderId, reference }),
+    }),
+
   pollPaymentStatus: (lencoReference) =>
     request(`/api/payments/status/${lencoReference}`),
 
