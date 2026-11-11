@@ -21,6 +21,21 @@ logger = logging.getLogger("bomapos.lenco")
 ACTIVE_ATTEMPT_STATUSES = ("initiating", "pending", "otp-required", "pay-offline")
 
 
+class LencoError(RuntimeError):
+    """Base error for Lenco client operations."""
+    pass
+
+
+class LencoRejectedError(LencoError):
+    """Raised for HTTP 4xx client errors from Lenco (e.g. invalid payload, rejected prompt, duplicate)."""
+    pass
+
+
+class LencoUnavailableError(LencoError):
+    """Raised for timeouts, network connection failures, or HTTP 5xx provider errors."""
+    pass
+
+
 def mask_phone(phone: str) -> str:
     """Mask phone number so full customer phone numbers are never logged."""
     cleaned = (phone or "").strip()
@@ -285,16 +300,66 @@ class LiveLencoClient(LencoClient):
                     json=payload,
                     headers=self._headers(),
                 )
+                if 400 <= resp.status_code < 500:
+                    err_msg = ""
+                    try:
+                        err_body = resp.json()
+                        err_msg = str(
+                            err_body.get("message")
+                            or err_body.get("detail")
+                            or err_body.get("error")
+                            or ""
+                        )
+                    except Exception:
+                        pass
+                    if not err_msg:
+                        err_msg = f"Payment request rejected by Lenco ({resp.status_code})"
+                    err_msg = re.sub(
+                        r"\b(\+?260\d{9}|0\d{9})\b",
+                        lambda m: mask_phone(m.group(0)),
+                        err_msg,
+                    )
+                    logger.warning(
+                        "Lenco collect_mobile_money 4xx rejection for ref=%s (phone=%s): %s",
+                        reference,
+                        mask_phone(formatted_phone),
+                        err_msg,
+                    )
+                    raise LencoRejectedError(err_msg)
+
                 resp.raise_for_status()
                 body = resp.json()
+        except LencoRejectedError:
+            raise
+        except (httpx.TimeoutException, httpx.NetworkError, httpx.ConnectError) as exc:
+            logger.error(
+                "Lenco collect_mobile_money network/timeout error for ref=%s (phone=%s): %s",
+                reference,
+                mask_phone(formatted_phone),
+                exc.__class__.__name__,
+            )
+            raise LencoUnavailableError(
+                "Payment provider timed out or network connection failed"
+            ) from exc
+        except httpx.HTTPStatusError as exc:
+            status_code = exc.response.status_code if exc.response is not None else 500
+            logger.error(
+                "Lenco collect_mobile_money 5xx error for ref=%s (phone=%s): status=%d",
+                reference,
+                mask_phone(formatted_phone),
+                status_code,
+            )
+            raise LencoUnavailableError(
+                f"Payment provider server error ({status_code})"
+            ) from exc
         except httpx.HTTPError as exc:
             logger.error(
                 "Lenco collect_mobile_money HTTP error for ref=%s (phone=%s): %s",
                 reference,
-                mask_phone(phone),
+                mask_phone(formatted_phone),
                 exc.__class__.__name__,
             )
-            raise RuntimeError(
+            raise LencoUnavailableError(
                 "Failed to initiate mobile money collection with Lenco"
             ) from exc
 
@@ -403,11 +468,23 @@ class MockLencoClient(LencoClient):
         self._collections: Dict[str, LencoCollectionResult] = {}
         self._next_initial_status: Optional[str] = None
         self._otp_next_status: str = "pay-offline"
+        self._next_error: Optional[Exception] = None
+        self._reference_errors: Dict[str, Exception] = {}
 
     def reset(self) -> None:
         self._collections.clear()
         self._next_initial_status = None
         self._otp_next_status = "pay-offline"
+        self._next_error = None
+        self._reference_errors.clear()
+
+    def set_next_error(self, error: Optional[Exception]) -> None:
+        """Configure an exception (e.g. LencoRejectedError, LencoUnavailableError) to be raised by collect_mobile_money."""
+        self._next_error = error
+
+    def set_reference_error(self, reference: str, error: Exception) -> None:
+        """Configure an exception to be raised when get_collection_by_reference is called for reference."""
+        self._reference_errors[reference] = error
 
     def set_next_initial_status(self, status: Optional[str]) -> None:
         """Configure the status returned by the next collect_mobile_money call (e.g. 'otp-required', 'pay-offline', 'pending')."""
@@ -428,6 +505,11 @@ class MockLencoClient(LencoClient):
         amount_ngwee: int,
         currency: str = "ZMW",
     ) -> LencoCollectionResult:
+        if self._next_error is not None:
+            err = self._next_error
+            self._next_error = None
+            raise err
+
         formatted_phone = format_zambian_phone(phone)
         logger.info(
             "MockLencoClient.collect_mobile_money ref=%s operator=%s phone=%s amount_ngwee=%d",
@@ -505,6 +587,9 @@ class MockLencoClient(LencoClient):
     def get_collection_by_reference(
         self, reference: str
     ) -> Optional[LencoCollectionResult]:
+        if reference in self._reference_errors:
+            err = self._reference_errors.pop(reference)
+            raise err
         item = self._collections.get(reference)
         if item is None:
             return None
