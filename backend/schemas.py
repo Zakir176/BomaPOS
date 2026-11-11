@@ -306,6 +306,7 @@ class ReconciliationResponse(BaseModel):
     settled_failed_count: int
     expired_count: int = 0
     still_pending_count: int
+    error_count: int = 0
 
 
 # ---------------------------------------------------------
