@@ -67,7 +67,14 @@ uvicorn main:app --app-dir backend --reload --port 8000
 4. **How Webhook Verification & Reconciliation Work**:
    - Lenco signs raw webhook request bodies using `HMAC-SHA512` keyed with `sha256(LENCO_API_TOKEN).hexdigest()` and sends the hex digest in the `X-Lenco-Signature` header.
    - `POST /api/webhooks/lenco` verifies `X-Lenco-Signature` against the raw request bytes before parsing JSON, resolves the order's `tenant_id` via `resolve_tenant_for_lenco_ref`, binds the DB session to that tenant under RLS, re-fetches the collection from Lenco (`GET /collections/status/{reference}`), and verifies that `status`, `amount`, and `currency` (`ZMW`) match the order before marking it `paid` and decrementing drink stock.
-   - If a webhook is missed, owners can trigger `POST /api/payments/reconcile` (or run `reconcile_all_tenants_stuck_orders()`), which queries Lenco for orders stuck in `pending` for more than 10 minutes and settles them through the same verification path.
+   - If a webhook is missed, owners can trigger `POST /api/payments/reconcile` (or run `reconcile_all_tenants_stuck_orders()`), which queries Lenco in lock-free batches of 50 and settles or expires attempts (`> 30 minutes` and confirmed not-successful at Lenco become `expired`, while late webhooks still settle `expired` orders).
+5. **Host Scheduler Cron (`POST /internal/reconcile`)**:
+   - Configure the host scheduler (e.g., `cron`, `systemd` timer, or cloud scheduler) to call `POST /internal/reconcile` every **5 minutes** with the `X-Cron-Secret` header matching `CRON_SECRET`:
+     ```bash
+     # Crontab entry (every 5 minutes)
+     */5 * * * * curl -fsS -X POST http://127.0.0.1:8000/internal/reconcile -H "X-Cron-Secret: ${CRON_SECRET}" >/dev/null
+     ```
+   - When `LENCO_MODE=live`, the application refuses to start if `CRON_SECRET` is missing.
 
 ## Running the Test Suite
 The test suite uses `TEST_DATABASE_URL` (`bomapos_app`), `TEST_ADMIN_DATABASE_URL` (`postgres`), and `LENCO_MODE=mock`, automatically applies `alembic upgrade head`, seeds both tenants, and verifies core POS workflows, atomic stock deduction, money conversion, `Africa/Lusaka` timezone grouping, JWT auth, Lenco webhook HMAC verification, reconciliation, and cross-tenant + RLS isolation:
