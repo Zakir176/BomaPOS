@@ -265,6 +265,18 @@ class MobileMoneySubmitOtpRequest(BaseModel):
     reference: Optional[str] = None
 
 
+class MobileMoneyAbandonRequest(BaseModel):
+    order_id: int
+    reference: str
+
+
+class MobileMoneyAbandonResponse(BaseModel):
+    status: str
+    order_id: int
+    reference: str
+    message: str
+
+
 class MobileMoneyInitiateResponse(BaseModel):
     status: str
     message: str

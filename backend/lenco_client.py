@@ -1,12 +1,15 @@
+
 import hashlib
 import hmac
 import logging
 import os
+import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, replace
 from typing import Any, Dict, Optional
 
 import httpx
+from fastapi import HTTPException, status
 
 try:
     from .money import ngwee_to_zmw, zmw_to_ngwee
@@ -15,7 +18,7 @@ except ImportError:
 
 logger = logging.getLogger("bomapos.lenco")
 
-ACTIVE_ATTEMPT_STATUSES = ("pending", "otp-required", "pay-offline")
+ACTIVE_ATTEMPT_STATUSES = ("initiating", "pending", "otp-required", "pay-offline")
 
 
 def mask_phone(phone: str) -> str:
@@ -26,13 +29,54 @@ def mask_phone(phone: str) -> str:
     return f"***{cleaned[-3:]}"
 
 
+def format_zambian_phone(phone: str, format_type: Optional[str] = None) -> str:
+    """
+    Format and validate Zambian phone number across all Lenco operations.
+    Configurable via LENCO_PHONE_FORMAT=local|international (default: local).
+      - local: 0977123456 (10 digits starting with 0)
+      - international: 260977123456 (12 digits MSISDN)
+    """
+    cleaned = re.sub(r"[\s\-\(\)]", "", (phone or "").strip())
+    if cleaned.startswith("+260"):
+        cleaned = cleaned[4:]
+    elif cleaned.startswith("260"):
+        cleaned = cleaned[3:]
+    elif cleaned.startswith("0"):
+        cleaned = cleaned[1:]
+
+    pattern = r"^(97|96|95|77|76|75)\d{7}$"
+    if not re.match(pattern, cleaned):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid Zambian phone number format. Expected 097/096/095/077/076/075 series or 260...",
+        )
+
+    mode = (
+        format_type
+        if format_type is not None
+        else os.getenv("LENCO_PHONE_FORMAT", "local")
+    ).strip().lower()
+
+    if mode == "international":
+        return f"260{cleaned}"
+    return f"0{cleaned}"
+
+
+# Alias for backwards compatibility
+normalize_zambian_phone = format_zambian_phone
+
+
 def _normalize_lenco_status(raw_status: str) -> str:
-    """Keep Lenco's statuses distinct: pending, otp-required, pay-offline, successful, failed, expired."""
+    """Keep Lenco's statuses distinct: initiating, pending, otp-required, pay-offline, successful, failed, expired, abandoned."""
     st = (raw_status or "").strip().lower()
     if st in ("successful", "success", "paid"):
         return "successful"
     if st in ("failed", "declined", "cancelled"):
         return "failed"
+    if st == "initiating":
+        return "initiating"
+    if st == "abandoned":
+        return "abandoned"
     if st == "expired":
         return "expired"
     if st == "otp-required":
@@ -215,11 +259,12 @@ class LiveLencoClient(LencoClient):
         amount_ngwee: int,
         currency: str = "ZMW",
     ) -> LencoCollectionResult:
+        formatted_phone = format_zambian_phone(phone)
         amount_zmw_str = f"{ngwee_to_zmw(amount_ngwee):.2f}"
         payload = {
             "amount": amount_zmw_str,
             "reference": reference,
-            "phone": phone,
+            "phone": formatted_phone,
             "operator": operator.lower(),
             "country": "zm",
             "bearer": "merchant",
@@ -228,7 +273,7 @@ class LiveLencoClient(LencoClient):
             "Initiating Lenco mobile money collection ref=%s operator=%s phone=%s amount_zmw=%s",
             reference,
             operator,
-            mask_phone(phone),
+            mask_phone(formatted_phone),
             amount_zmw_str,
         )
         try:
@@ -383,17 +428,18 @@ class MockLencoClient(LencoClient):
         amount_ngwee: int,
         currency: str = "ZMW",
     ) -> LencoCollectionResult:
+        formatted_phone = format_zambian_phone(phone)
         logger.info(
             "MockLencoClient.collect_mobile_money ref=%s operator=%s phone=%s amount_ngwee=%d",
             reference,
             operator,
-            mask_phone(phone),
+            mask_phone(formatted_phone),
             amount_ngwee,
         )
         if self._next_initial_status is not None:
             initial_status = self._next_initial_status
             self._next_initial_status = None
-        elif phone.strip().endswith("0000"):
+        elif formatted_phone.strip().endswith("0000"):
             initial_status = "otp-required"
         else:
             initial_status = "pay-offline"

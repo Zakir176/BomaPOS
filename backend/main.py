@@ -15,7 +15,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, Depends, HTTPException, Header, Query, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
-from sqlalchemy import func, case, cast, Date, extract, update, text
+from sqlalchemy import func, case, cast, Date, extract, update, text, or_, and_
 from passlib.context import CryptContext
 
 load_dotenv()
@@ -26,6 +26,7 @@ try:
         ACTIVE_ATTEMPT_STATUSES,
         LencoClient,
         LencoCollectionResult,
+        format_zambian_phone,
         get_lenco_client,
         verify_lenco_webhook_signature,
     )
@@ -53,6 +54,8 @@ try:
         OrderResponse,
         MobileMoneyInitiateRequest,
         MobileMoneySubmitOtpRequest,
+        MobileMoneyAbandonRequest,
+        MobileMoneyAbandonResponse,
         MobileMoneyInitiateResponse,
         PaymentStatusResponse,
         ReconciliationResponse,
@@ -65,6 +68,7 @@ except ImportError:
         ACTIVE_ATTEMPT_STATUSES,
         LencoClient,
         LencoCollectionResult,
+        format_zambian_phone,
         get_lenco_client,
         verify_lenco_webhook_signature,
     )
@@ -92,6 +96,8 @@ except ImportError:
         OrderResponse,
         MobileMoneyInitiateRequest,
         MobileMoneySubmitOtpRequest,
+        MobileMoneyAbandonRequest,
+        MobileMoneyAbandonResponse,
         MobileMoneyInitiateResponse,
         PaymentStatusResponse,
         ReconciliationResponse,
@@ -148,7 +154,43 @@ def validate_cron_secret(
     return secret
 
 
-# Fail startup if CRON_SECRET is missing in live mode
+def validate_startup_config(
+    lenco_mode: Optional[str] = None,
+    lenco_api_token: Optional[str] = None,
+    cron_secret: Optional[str] = None,
+) -> None:
+    """
+    Ensure required environment variables are set on startup.
+    When LENCO_MODE=live, both LENCO_API_TOKEN and CRON_SECRET are strictly required.
+    """
+    mode = (
+        lenco_mode
+        if lenco_mode is not None
+        else os.environ.get("LENCO_MODE", "mock")
+    ).strip().lower()
+    if mode == "live":
+        token = (
+            lenco_api_token
+            if lenco_api_token is not None
+            else os.environ.get("LENCO_API_TOKEN", "")
+        ).strip()
+        if not token:
+            raise RuntimeError(
+                "LENCO_API_TOKEN environment variable is required when LENCO_MODE=live"
+            )
+        secret = (
+            cron_secret
+            if cron_secret is not None
+            else get_cron_secret()
+        ).strip()
+        if not secret:
+            raise RuntimeError(
+                "CRON_SECRET environment variable must be set when LENCO_MODE=live"
+            )
+
+
+# Fail startup if LENCO_API_TOKEN or CRON_SECRET is missing in live mode
+validate_startup_config()
 validate_cron_secret()
 
 
@@ -885,20 +927,7 @@ def create_order(
 # ---------------------------------------------------------
 # 5. Lenco Mobile Money Integration, Webhook & Reconciliation
 # ---------------------------------------------------------
-def normalize_zambian_phone(phone: str) -> str:
-    cleaned = re.sub(r"[\s\-\(\)]", "", phone.strip())
-    if cleaned.startswith("+260"):
-        cleaned = cleaned[1:]
-    elif cleaned.startswith("0"):
-        cleaned = "260" + cleaned[1:]
-
-    pattern = r"^260(97|96|95|77|76|75)\d{7}$"
-    if not re.match(pattern, cleaned):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid Zambian phone number format. Expected 097/096/095/077/076/075 series or 260...",
-        )
-    return cleaned
+normalize_zambian_phone = format_zambian_phone
 
 
 PAYMENT_ATTEMPT_EXPIRY_MINUTES = 30
@@ -958,6 +987,28 @@ def settle_order_with_collection(
         _update_attempt_from_collection(attempt, collection)
 
     if order.payment_status == "paid":
+        is_same_attempt = False
+        if attempt is not None and attempt.reference == order.lenco_reference:
+            is_same_attempt = True
+        elif attempt is None and collection.reference == order.lenco_reference:
+            is_same_attempt = True
+
+        if collection.status == "successful" and not is_same_attempt:
+            order.needs_review = True
+            ref_str = attempt.reference if attempt is not None else collection.reference
+            dup_reason = f"Duplicate payment on attempt {ref_str}: refund required"
+            if order.review_reason:
+                if dup_reason not in order.review_reason:
+                    order.review_reason = f"{order.review_reason}; {dup_reason}"
+            else:
+                order.review_reason = dup_reason
+
+            if attempt is not None:
+                attempt.status = "successful"
+                attempt.updated_at = datetime.now(timezone.utc)
+            db.commit()
+            return "duplicate_paid"
+
         if attempt is not None:
             db.commit()
         return "already_paid"
@@ -1047,11 +1098,44 @@ def initiate_mobile_money_payment(
 
     for prev_attempt in existing_attempts:
         if prev_attempt.status in ACTIVE_ATTEMPT_STATUSES:
+            if prev_attempt.status == "initiating":
+                if prev_attempt.created_at <= now - timedelta(minutes=2):
+                    provider_col = lenco_client.get_collection_by_reference(
+                        prev_attempt.reference
+                    )
+                    if provider_col is None:
+                        prev_attempt.status = "failed"
+                        prev_attempt.updated_at = now
+                        db.commit()
+                        continue
+                    else:
+                        _update_attempt_from_collection(prev_attempt, provider_col)
+                        if provider_col.status == "successful":
+                            settle_order_with_collection(
+                                db=db,
+                                tenant_id=tenant_id,
+                                order=order,
+                                collection=provider_col,
+                                attempt=prev_attempt,
+                            )
+                            raise HTTPException(
+                                status_code=status.HTTP_400_BAD_REQUEST,
+                                detail="Order has already been paid via an existing payment attempt",
+                            )
+                        if provider_col.status in ("failed", "expired"):
+                            db.commit()
+                            continue
+                db.commit()
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=f"An active payment attempt ({prev_attempt.reference}) is already in progress for this order",
+                )
+
             provider_col = lenco_client.get_collection_by_reference(
                 prev_attempt.reference
             )
-            effective_created = min(prev_attempt.created_at, order.created_at)
-            is_past_expiry = effective_created <= expiry_cutoff
+            # Use attempt's own created_at only, never order.created_at
+            is_past_expiry = prev_attempt.created_at <= expiry_cutoff
 
             if provider_col is not None:
                 _update_attempt_from_collection(prev_attempt, provider_col)
@@ -1085,25 +1169,14 @@ def initiate_mobile_money_payment(
                 detail=f"An active payment attempt ({prev_attempt.reference}) is already in progress for this order",
             )
 
-    # Create a NEW payment attempt with an unguessable uuid4 reference (never overwrite an earlier attempt)
+    # 1. Write-ahead attempt: insert PaymentAttempt with status 'initiating' and COMMIT before calling Lenco
     attempt_ref = str(uuid.uuid4())
-    collection = lenco_client.collect_mobile_money(
-        reference=attempt_ref,
-        phone=normalized_phone,
-        operator=payload.operator,
-        amount_ngwee=order.total_ngwee,
-        currency="ZMW",
-    )
-
     new_attempt = PaymentAttempt(
         tenant_id=tenant_id,
         order_id=order.id,
         reference=attempt_ref,
-        lenco_reference=collection.lenco_reference,
-        status=collection.status,
-        fee_ngwee=collection.fee_ngwee,
-        fee_bearer=collection.fee_bearer,
-        settlement_status=collection.settlement_status,
+        lenco_reference=None,
+        status="initiating",
         created_at=now,
         updated_at=now,
     )
@@ -1111,18 +1184,59 @@ def initiate_mobile_money_payment(
     order.lenco_reference = attempt_ref
     if order.payment_status in ("failed", "expired"):
         order.payment_status = "pending"
-    db.flush()
+    db.commit()
+    db.refresh(new_attempt)
+
+    try:
+        collection = lenco_client.collect_mobile_money(
+            reference=attempt_ref,
+            phone=normalized_phone,
+            operator=payload.operator,
+            amount_ngwee=order.total_ngwee,
+            currency="ZMW",
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error(
+            "Lenco collect_mobile_money failed for ref=%s: %s",
+            attempt_ref,
+            exc,
+            exc_info=True,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Payment provider timed out or returned an error. Check payment status or wait for reconciliation instead of retrying blindly.",
+        )
+
+    # Re-fetch attempt and order under tenant session
+    bind_session_to_tenant(db, tenant_id)
+    attempt_in_db = (
+        db.query(PaymentAttempt)
+        .filter(PaymentAttempt.id == new_attempt.id, PaymentAttempt.tenant_id == tenant_id)
+        .with_for_update()
+        .first()
+    )
+    order_in_db = (
+        db.query(Order)
+        .filter(Order.id == order.id, Order.tenant_id == tenant_id)
+        .with_for_update()
+        .first()
+    )
+    if attempt_in_db is not None:
+        _update_attempt_from_collection(attempt_in_db, collection)
 
     if collection.status == "successful":
         settle_order_with_collection(
             db=db,
             tenant_id=tenant_id,
-            order=order,
+            order=order_in_db or order,
             collection=collection,
-            attempt=new_attempt,
+            attempt=attempt_in_db,
         )
     elif collection.status == "failed":
-        order.payment_status = "failed"
+        if order_in_db is not None:
+            order_in_db.payment_status = "failed"
         db.commit()
     else:
         db.commit()
@@ -1223,6 +1337,67 @@ def submit_mobile_money_otp(
     )
 
 
+@app.post(
+    "/api/payments/mobile-money/abandon",
+    response_model=MobileMoneyAbandonResponse,
+)
+def abandon_mobile_money_payment(
+    payload: MobileMoneyAbandonRequest,
+    db: Session = Depends(get_tenant_db),
+    _: User = Depends(get_current_user),
+):
+    """
+    Marks a payment attempt 'abandoned' locally so a new attempt is allowed.
+    Reconciliation continues to query abandoned attempts for 60 minutes so a late success
+    is settled or flagged as a duplicate.
+    """
+    tenant_id = db.info["tenant_id"]
+    order = (
+        db.query(Order)
+        .filter(Order.id == payload.order_id, Order.tenant_id == tenant_id)
+        .with_for_update()
+        .first()
+    )
+    if not order:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Order with id {payload.order_id} not found",
+        )
+
+    attempt = (
+        db.query(PaymentAttempt)
+        .filter(
+            PaymentAttempt.tenant_id == tenant_id,
+            PaymentAttempt.order_id == order.id,
+            PaymentAttempt.reference == payload.reference,
+        )
+        .with_for_update()
+        .first()
+    )
+    if not attempt:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Payment attempt with reference '{payload.reference}' not found",
+        )
+
+    if attempt.status == "successful":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot abandon a successful payment attempt",
+        )
+
+    attempt.status = "abandoned"
+    attempt.updated_at = datetime.now(timezone.utc)
+    db.commit()
+
+    return MobileMoneyAbandonResponse(
+        status="abandoned",
+        order_id=order.id,
+        reference=attempt.reference,
+        message="Payment attempt abandoned locally. A new attempt can now be initiated.",
+    )
+
+
 @app.post("/api/webhooks/lenco")
 async def lenco_webhook(
     request: Request,
@@ -1314,12 +1489,17 @@ async def lenco_webhook(
 
     # Idempotency check: replays are a no-op
     if order.payment_status == "paid":
-        if attempt is not None and attempt.status != "successful" and expected_status == "successful":
-            col = lenco_client.get_collection_by_reference(attempt.reference)
-            if col and col.status == "successful":
-                _update_attempt_from_collection(attempt, col)
-                db.commit()
-        return {"status": "noop", "message": "Order already marked paid"}
+        is_same_attempt = False
+        if attempt is not None and attempt.reference == order.lenco_reference:
+            is_same_attempt = True
+        elif attempt is None and reference == order.lenco_reference:
+            is_same_attempt = True
+
+        if expected_status == "successful" and not is_same_attempt:
+            # Duplicate payment detected on another attempt! Let settle_order_with_collection handle it.
+            pass
+        else:
+            return {"status": "noop", "message": "Order already marked paid"}
 
     if (
         attempt is not None
@@ -1347,6 +1527,12 @@ async def lenco_webhook(
             "message": "Payment confirmed and drink stock updated",
             "needs_review": order.needs_review,
         }
+    if outcome == "duplicate_paid":
+        return {
+            "status": "success",
+            "message": "Duplicate payment recorded for review",
+            "needs_review": order.needs_review,
+        }
     if outcome == "failed":
         return {"status": "failed", "message": "Order marked as payment failed"}
     return {"status": outcome, "message": "No state transition required"}
@@ -1367,6 +1553,8 @@ def reconcile_tenant_pending_orders(
     """
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(minutes=older_than_minutes)
+    initiating_cutoff = now - timedelta(minutes=2)
+    abandoned_cutoff = now - timedelta(minutes=60)
     expiry_cutoff = now - timedelta(minutes=PAYMENT_ATTEMPT_EXPIRY_MINUTES)
 
     checked = 0
@@ -1389,9 +1577,20 @@ def reconcile_tenant_pending_orders(
                 PaymentAttempt.tenant_id == tenant_id,
                 PaymentAttempt.id > last_seen_id,
                 Order.payment_method == "mobile_money",
-                Order.payment_status.in_(("pending", "expired")),
-                PaymentAttempt.status.in_((*ACTIVE_ATTEMPT_STATUSES, "expired")),
-                (PaymentAttempt.created_at <= cutoff) | (Order.created_at <= cutoff),
+                or_(
+                    and_(
+                        PaymentAttempt.status == "initiating",
+                        PaymentAttempt.created_at <= initiating_cutoff,
+                    ),
+                    and_(
+                        PaymentAttempt.status.in_(("pending", "otp-required", "pay-offline", "expired")),
+                        (PaymentAttempt.created_at <= cutoff) | (Order.created_at <= cutoff),
+                    ),
+                    and_(
+                        PaymentAttempt.status == "abandoned",
+                        PaymentAttempt.created_at >= abandoned_cutoff,
+                    ),
+                ),
             )
             .order_by(PaymentAttempt.id.asc())
             .limit(RECONCILE_BATCH_SIZE)
@@ -1434,8 +1633,119 @@ def reconcile_tenant_pending_orders(
                 .with_for_update()
                 .first()
             )
-            if not locked_order or locked_order.payment_status == "paid":
+            if not locked_order:
                 db.commit()
+                continue
+
+            # Special case for 'initiating': older than 2 minutes
+            if locked_attempt.status == "initiating":
+                if collection is None:
+                    locked_attempt.status = "failed"
+                    locked_attempt.updated_at = datetime.now(timezone.utc)
+                    other_active = (
+                        db.query(PaymentAttempt.id)
+                        .filter(
+                            PaymentAttempt.tenant_id == tenant_id,
+                            PaymentAttempt.order_id == locked_order.id,
+                            PaymentAttempt.id != locked_attempt.id,
+                            PaymentAttempt.status.in_(ACTIVE_ATTEMPT_STATUSES),
+                        )
+                        .first()
+                    )
+                    if not other_active and locked_order.payment_status != "paid":
+                        locked_order.payment_status = "failed"
+                    db.commit()
+                    failed_count += 1
+                    continue
+                else:
+                    _update_attempt_from_collection(locked_attempt, collection)
+                    if collection.status in ("successful", "failed"):
+                        try:
+                            outcome = settle_order_with_collection(
+                                db=db,
+                                tenant_id=tenant_id,
+                                order=locked_order,
+                                collection=collection,
+                                attempt=locked_attempt,
+                            )
+                            if outcome in ("paid", "duplicate_paid"):
+                                paid_count += 1
+                            elif outcome == "failed":
+                                failed_count += 1
+                            else:
+                                pending_count += 1
+                        except HTTPException as exc:
+                            db.rollback()
+                            logger.warning(
+                                "Reconciliation skipped order_id=%s ref=%s: %s",
+                                locked_order.id,
+                                attempt_ref,
+                                exc.detail,
+                            )
+                            pending_count += 1
+                    else:
+                        db.commit()
+                        pending_count += 1
+                    continue
+
+            # If order is already paid, check if this attempt is a duplicate success
+            if locked_order.payment_status == "paid":
+                if (
+                    collection is not None
+                    and collection.status == "successful"
+                    and locked_attempt.status != "successful"
+                ):
+                    try:
+                        outcome = settle_order_with_collection(
+                            db=db,
+                            tenant_id=tenant_id,
+                            order=locked_order,
+                            collection=collection,
+                            attempt=locked_attempt,
+                        )
+                        if outcome in ("paid", "duplicate_paid"):
+                            paid_count += 1
+                        else:
+                            pending_count += 1
+                    except HTTPException as exc:
+                        db.rollback()
+                        logger.warning(
+                            "Reconciliation skipped duplicate order_id=%s ref=%s: %s",
+                            locked_order.id,
+                            attempt_ref,
+                            exc.detail,
+                        )
+                        pending_count += 1
+                else:
+                    db.commit()
+                continue
+
+            # If attempt is 'abandoned':
+            if locked_attempt.status == "abandoned":
+                if collection is not None and collection.status == "successful":
+                    try:
+                        outcome = settle_order_with_collection(
+                            db=db,
+                            tenant_id=tenant_id,
+                            order=locked_order,
+                            collection=collection,
+                            attempt=locked_attempt,
+                        )
+                        if outcome in ("paid", "duplicate_paid"):
+                            paid_count += 1
+                        else:
+                            pending_count += 1
+                    except HTTPException as exc:
+                        db.rollback()
+                        logger.warning(
+                            "Reconciliation skipped abandoned order_id=%s ref=%s: %s",
+                            locked_order.id,
+                            attempt_ref,
+                            exc.detail,
+                        )
+                        pending_count += 1
+                else:
+                    db.commit()
                 continue
 
             # If already expired and still not successful at Lenco, nothing further to transition
@@ -1449,8 +1759,8 @@ def reconcile_tenant_pending_orders(
                 db.commit()
                 continue
 
-            effective_created = min(locked_attempt.created_at, locked_order.created_at)
-            is_expired_by_age = effective_created <= expiry_cutoff
+            # Expiry check using attempt's own created_at only!
+            is_expired_by_age = locked_attempt.created_at <= expiry_cutoff
 
             if collection is not None and collection.status in ("successful", "failed"):
                 try:
@@ -1461,7 +1771,7 @@ def reconcile_tenant_pending_orders(
                         collection=collection,
                         attempt=locked_attempt,
                     )
-                    if outcome == "paid":
+                    if outcome in ("paid", "duplicate_paid"):
                         paid_count += 1
                     elif outcome == "failed":
                         failed_count += 1
