@@ -333,33 +333,42 @@ def test_lenco_webhook_rejects_unsigned_requests():
     assert res.status_code == 401
 
 def test_login_missing_tenant_slug_returns_generic_401():
-    """Verify login without tenant_slug or with empty slug returns generic 401."""
+    """Verify login without tenant_slug fails with the exact same generic 401 as a wrong password."""
     seed()
     reset_login_rate_limiter()
 
-    # 1. Missing tenant_slug field entirely
+    # 1. Baseline: wrong password returns generic 401
+    res_wrong_pw = client.post(
+        "/api/auth/login",
+        json={"tenant_slug": "aunts-lusaka", "username": "aunt", "password": "wrong-password"},
+    )
+    assert res_wrong_pw.status_code == 401
+    expected_error = res_wrong_pw.json()
+    assert expected_error["detail"] == "Invalid tenant, username, or password"
+
+    # 2. Missing tenant_slug field entirely returns the exact same 401
     res1 = client.post(
         "/api/auth/login",
         json={"username": "aunt", "password": "owner123"},
     )
     assert res1.status_code == 401
-    assert res1.json()["detail"] == "Invalid tenant, username, or password"
+    assert res1.json() == expected_error
 
-    # 2. Empty tenant_slug string
+    # 3. Empty tenant_slug string returns the exact same 401
     res2 = client.post(
         "/api/auth/login",
         json={"tenant_slug": "", "username": "aunt", "password": "owner123"},
     )
     assert res2.status_code == 401
-    assert res2.json()["detail"] == "Invalid tenant, username, or password"
+    assert res2.json() == expected_error
 
-    # 3. Whitespace-only tenant_slug
+    # 4. Whitespace-only tenant_slug returns the exact same 401
     res3 = client.post(
         "/api/auth/login",
         json={"tenant_slug": "   ", "username": "aunt", "password": "owner123"},
     )
     assert res3.status_code == 401
-    assert res3.json()["detail"] == "Invalid tenant, username, or password"
+    assert res3.json() == expected_error
 
 
 def test_refresh_token_reuse_detection_revokes_all_user_tokens():
@@ -417,48 +426,75 @@ def test_refresh_token_reuse_detection_revokes_all_user_tokens():
     assert res_token2_fail.status_code == 401
 
 
-def test_rate_limiter_trust_proxy_and_pruning():
-    """Verify rate limiter extracts client IP via X-Forwarded-For when TRUST_PROXY=true, and prunes expired keys."""
+def test_rate_limiter_spoofed_xff_ignored_when_trust_proxy_unset_and_prunes_expired_keys():
+    """Verify requests with spoofed X-Forwarded-For are ignored when TRUST_PROXY is unset, and expired rate-limit keys are pruned."""
     import time
     from main import _login_attempts, _prune_expired_login_attempts
 
     reset_login_rate_limiter()
 
-    # 1. Without TRUST_PROXY, X-Forwarded-For is ignored
-    os.environ["TRUST_PROXY"] = "false"
-    res1 = client.post(
+    # 1. When TRUST_PROXY is UNSET, spoofed X-Forwarded-For is ignored
+    os.environ.pop("TRUST_PROXY", None)
+    res_unset = client.post(
         "/api/auth/login",
         headers={"X-Forwarded-For": "203.0.113.195, 70.41.3.18"},
         json={"tenant_slug": "aunts-lusaka", "username": "aunt", "password": "wrong-password"},
     )
-    assert res1.status_code == 401
-    # Key in _login_attempts should use "testclient" (TestClient default host), not "203.0.113.195"
+    assert res_unset.status_code == 401
+    # Spoofed IP must NOT appear in rate limiter keys
+    assert not any("203.0.113.195" in k for k in _login_attempts.keys())
+    assert any("testclient:aunts-lusaka:aunt" in k for k in _login_attempts.keys())
+
+    # 2. When TRUST_PROXY is explicitly 'false', spoofed X-Forwarded-For is also ignored
+    reset_login_rate_limiter()
+    os.environ["TRUST_PROXY"] = "false"
+    res_false = client.post(
+        "/api/auth/login",
+        headers={"X-Forwarded-For": "203.0.113.195, 70.41.3.18"},
+        json={"tenant_slug": "aunts-lusaka", "username": "aunt", "password": "wrong-password"},
+    )
+    assert res_false.status_code == 401
     assert not any("203.0.113.195" in k for k in _login_attempts.keys())
 
-    # 2. With TRUST_PROXY=true, first hop in X-Forwarded-For is used
+    # 3. When TRUST_PROXY is 'true', first hop appended by proxy is used
     reset_login_rate_limiter()
     os.environ["TRUST_PROXY"] = "true"
-    res2 = client.post(
+    res_true = client.post(
         "/api/auth/login",
         headers={"X-Forwarded-For": "203.0.113.195, 70.41.3.18"},
         json={"tenant_slug": "aunts-lusaka", "username": "aunt", "password": "wrong-password"},
     )
-    assert res2.status_code == 401
-    expected_prefix = "203.0.113.195:aunts-lusaka:aunt"
-    assert expected_prefix in _login_attempts
-    assert len(_login_attempts[expected_prefix]) == 1
+    assert res_true.status_code == 401
+    expected_trusted_key = "203.0.113.195:aunts-lusaka:aunt"
+    assert expected_trusted_key in _login_attempts
+    assert len(_login_attempts[expected_trusted_key]) == 1
 
-    # 3. Test pruning of expired entries
+    # 4. Prune expired keys: test both automatic pruning on request and helper pruning
     now = time.monotonic()
-    # Inject expired entry
-    _login_attempts["stale-client:tenant:user"] = [now - 120.0]
-    assert "stale-client:tenant:user" in _login_attempts
+    # Inject an expired key and a key with mixed timestamps
+    _login_attempts["stale-expired-client:tenant:user"] = [now - 120.0, now - 65.0]
+    _login_attempts["mixed-client:tenant:user"] = [now - 80.0, now - 10.0]
 
-    # Prune should remove the stale key
+    assert "stale-expired-client:tenant:user" in _login_attempts
+    assert len(_login_attempts["mixed-client:tenant:user"]) == 2
+
+    # Making a new request automatically triggers _prune_expired_login_attempts
+    client.post(
+        "/api/auth/login",
+        json={"tenant_slug": "aunts-lusaka", "username": "aunt", "password": "wrong-password"},
+    )
+
+    # Fully expired key must be completely pruned
+    assert "stale-expired-client:tenant:user" not in _login_attempts
+    # Mixed key must have only the fresh timestamp (< 60s)
+    assert "mixed-client:tenant:user" in _login_attempts
+    assert len(_login_attempts["mixed-client:tenant:user"]) == 1
+
+    # Direct helper test for any remaining edge cases
+    _login_attempts["manual-stale:t:u"] = [now - 90.0]
     _prune_expired_login_attempts(now)
-    assert "stale-client:tenant:user" not in _login_attempts
-    assert expected_prefix in _login_attempts
+    assert "manual-stale:t:u" not in _login_attempts
 
     # Clean up environment
-    os.environ["TRUST_PROXY"] = "false"
+    os.environ.pop("TRUST_PROXY", None)
     reset_login_rate_limiter()
