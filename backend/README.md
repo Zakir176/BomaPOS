@@ -20,6 +20,7 @@ TEST_DATABASE_URL=postgresql+psycopg://bomapos_app:bomapos_app@localhost:5432/bo
 TEST_ADMIN_DATABASE_URL=postgresql+psycopg://postgres:postgres@localhost:5432/bomapos_test
 JWT_SECRET=change-me-to-a-secure-random-secret-at-least-32-chars-long
 ALLOWED_ORIGINS=http://localhost:5173,http://127.0.0.1:5173
+TRUSTED_PROXY_COUNT=0
 LENCO_MODE=mock
 LENCO_API_TOKEN=replace-with-your-lenco-secret-api-token
 LENCO_API_BASE_URL=https://api.lenco.co/access/v2
@@ -41,6 +42,13 @@ Seed two isolated tenants (`aunts-lusaka` and `boma-kitwe`) with overlapping use
 ```bash
 python backend/seed.py
 ```
+
+### Reverse Proxy & Client IP Trust (`TRUSTED_PROXY_COUNT`)
+To prevent client IP spoofing in login rate limiting, BomaPOS uses `TRUSTED_PROXY_COUNT` (default `0`):
+- When `0`: `X-Forwarded-For` is ignored completely and the direct socket client IP (`request.client.host`) is used.
+- When `N > 0`: the backend extracts the Nth IP entry counting from the **right** of `X-Forwarded-For` (the entry appended by your trusted reverse proxy infrastructure).
+- If there are fewer than N entries in `X-Forwarded-For`, it falls back safely to `request.client.host`.
+- Leftmost entries provided by untrusted clients are never used.
 
 ## Running the Dev Server
 ```bash
