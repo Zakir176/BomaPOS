@@ -426,75 +426,101 @@ def test_refresh_token_reuse_detection_revokes_all_user_tokens():
     assert res_token2_fail.status_code == 401
 
 
-def test_rate_limiter_spoofed_xff_ignored_when_trust_proxy_unset_and_prunes_expired_keys():
-    """Verify requests with spoofed X-Forwarded-For are ignored when TRUST_PROXY is unset, and expired rate-limit keys are pruned."""
+def test_rate_limiter_trusted_proxy_count_and_pruning():
+    """Verify TRUSTED_PROXY_COUNT (int, default 0) and 30-second global prune interval."""
     import time
-    from main import _login_attempts, _prune_expired_login_attempts
+    from main import (
+        _login_attempts,
+        _prune_expired_login_attempts,
+        reset_login_rate_limiter,
+        RATE_LIMIT_GLOBAL_PRUNE_INTERVAL_SECONDS,
+    )
 
     reset_login_rate_limiter()
 
-    # 1. When TRUST_PROXY is UNSET, spoofed X-Forwarded-For is ignored
-    os.environ.pop("TRUST_PROXY", None)
-    res_unset = client.post(
+    # 1. count=0 ignores X-Forwarded-For entirely and falls back to request.client.host
+    os.environ["TRUSTED_PROXY_COUNT"] = "0"
+    res_count_0 = client.post(
         "/api/auth/login",
         headers={"X-Forwarded-For": "203.0.113.195, 70.41.3.18"},
         json={"tenant_slug": "aunts-lusaka", "username": "aunt", "password": "wrong-password"},
     )
-    assert res_unset.status_code == 401
-    # Spoofed IP must NOT appear in rate limiter keys
-    assert not any("203.0.113.195" in k for k in _login_attempts.keys())
+    assert res_count_0.status_code == 401
+    assert not any("70.41.3.18" in k or "203.0.113.195" in k for k in _login_attempts.keys())
     assert any("testclient:aunts-lusaka:aunt" in k for k in _login_attempts.keys())
 
-    # 2. When TRUST_PROXY is explicitly 'false', spoofed X-Forwarded-For is also ignored
+    # 2. count=1 with a forged leftmost value: rate-limit key does NOT change between requests
     reset_login_rate_limiter()
-    os.environ["TRUST_PROXY"] = "false"
-    res_false = client.post(
+    os.environ["TRUSTED_PROXY_COUNT"] = "1"
+    # Request 1 with forged leftmost '1.1.1.1'
+    res_f1 = client.post(
         "/api/auth/login",
-        headers={"X-Forwarded-For": "203.0.113.195, 70.41.3.18"},
+        headers={"X-Forwarded-For": "1.1.1.1, 198.51.100.25"},
         json={"tenant_slug": "aunts-lusaka", "username": "aunt", "password": "wrong-password"},
     )
-    assert res_false.status_code == 401
-    assert not any("203.0.113.195" in k for k in _login_attempts.keys())
+    assert res_f1.status_code == 401
+    trusted_key = "198.51.100.25:aunts-lusaka:aunt"
+    assert trusted_key in _login_attempts
+    assert len(_login_attempts[trusted_key]) == 1
 
-    # 3. When TRUST_PROXY is 'true', first hop appended by proxy is used
-    reset_login_rate_limiter()
-    os.environ["TRUST_PROXY"] = "true"
-    res_true = client.post(
+    # Request 2 with different forged leftmost '2.2.2.2' but same proxy-appended IP
+    res_f2 = client.post(
         "/api/auth/login",
-        headers={"X-Forwarded-For": "203.0.113.195, 70.41.3.18"},
+        headers={"X-Forwarded-For": "2.2.2.2, 198.51.100.25"},
         json={"tenant_slug": "aunts-lusaka", "username": "aunt", "password": "wrong-password"},
     )
-    assert res_true.status_code == 401
-    expected_trusted_key = "203.0.113.195:aunts-lusaka:aunt"
-    assert expected_trusted_key in _login_attempts
-    assert len(_login_attempts[expected_trusted_key]) == 1
+    assert res_f2.status_code == 401
+    # Key did not change! Both attempts are recorded under 198.51.100.25
+    assert len(_login_attempts[trusted_key]) == 2
+    assert not any("1.1.1.1" in k or "2.2.2.2" in k for k in _login_attempts.keys())
 
-    # 4. Prune expired keys: test both automatic pruning on request and helper pruning
+    # 3. Fewer entries than N: falls back safely to request.client.host
+    reset_login_rate_limiter()
+    os.environ["TRUSTED_PROXY_COUNT"] = "3"
+    # Header only has 2 entries (< 3)
+    res_fewer = client.post(
+        "/api/auth/login",
+        headers={"X-Forwarded-For": "10.0.0.1, 10.0.0.2"},
+        json={"tenant_slug": "aunts-lusaka", "username": "aunt", "password": "wrong-password"},
+    )
+    assert res_fewer.status_code == 401
+    assert any("testclient:aunts-lusaka:aunt" in k for k in _login_attempts.keys())
+    assert not any("10.0.0" in k for k in _login_attempts.keys())
+
+    # 4. Rate limiter pruning:
+    # Global prune runs at most once per 30 seconds, not on every call,
+    # while still checking the specific key's window on every call.
+    reset_login_rate_limiter()
+    os.environ["TRUSTED_PROXY_COUNT"] = "0"
     now = time.monotonic()
-    # Inject an expired key and a key with mixed timestamps
-    _login_attempts["stale-expired-client:tenant:user"] = [now - 120.0, now - 65.0]
-    _login_attempts["mixed-client:tenant:user"] = [now - 80.0, now - 10.0]
 
-    assert "stale-expired-client:tenant:user" in _login_attempts
-    assert len(_login_attempts["mixed-client:tenant:user"]) == 2
+    # Initial call triggers the first global prune (since _last_global_prune_time was 0.0)
+    _login_attempts["unrelated_client:aunts-lusaka:cashier1"] = [now - 100.0]
+    _prune_expired_login_attempts(now)
+    assert "unrelated_client:aunts-lusaka:cashier1" not in _login_attempts
 
-    # Making a new request automatically triggers _prune_expired_login_attempts
+    # Inject an expired attempt for unrelated key and an expired attempt + fresh attempt for key A
+    _login_attempts["unrelated_client:aunts-lusaka:cashier1"] = [now - 90.0]
+    _login_attempts["testclient:aunts-lusaka:aunt"] = [now - 70.0, now + 1.0]
+
+    # Call at now + 5s (< 30s interval): global prune must NOT run over other keys
+    _prune_expired_login_attempts(now + 5.0)
+    # Unrelated key was NOT globally pruned yet because < 30s passed!
+    assert "unrelated_client:aunts-lusaka:cashier1" in _login_attempts
+
+    # But calling login for key A checks key A's own window immediately:
     client.post(
         "/api/auth/login",
         json={"tenant_slug": "aunts-lusaka", "username": "aunt", "password": "wrong-password"},
     )
+    # Key A has only unexpired timestamps (> now + 5s - 60s)
+    key_a_history = _login_attempts["testclient:aunts-lusaka:aunt"]
+    assert all(ts > (now + 5.0 - 60.0) for ts in key_a_history)
 
-    # Fully expired key must be completely pruned
-    assert "stale-expired-client:tenant:user" not in _login_attempts
-    # Mixed key must have only the fresh timestamp (< 60s)
-    assert "mixed-client:tenant:user" in _login_attempts
-    assert len(_login_attempts["mixed-client:tenant:user"]) == 1
+    # After 31 seconds, global prune runs and removes unrelated_client
+    _prune_expired_login_attempts(now + 32.0)
+    assert "unrelated_client:aunts-lusaka:cashier1" not in _login_attempts
 
-    # Direct helper test for any remaining edge cases
-    _login_attempts["manual-stale:t:u"] = [now - 90.0]
-    _prune_expired_login_attempts(now)
-    assert "manual-stale:t:u" not in _login_attempts
-
-    # Clean up environment
-    os.environ.pop("TRUST_PROXY", None)
+    # Clean up
+    os.environ["TRUSTED_PROXY_COUNT"] = "0"
     reset_login_rate_limiter()
