@@ -26,6 +26,8 @@ try:
         ACTIVE_ATTEMPT_STATUSES,
         LencoClient,
         LencoCollectionResult,
+        LencoConfigError,
+        LencoConflictError,
         LencoRejectedError,
         LencoUnavailableError,
         format_zambian_phone,
@@ -70,6 +72,8 @@ except ImportError:
         ACTIVE_ATTEMPT_STATUSES,
         LencoClient,
         LencoCollectionResult,
+        LencoConfigError,
+        LencoConflictError,
         LencoRejectedError,
         LencoUnavailableError,
         format_zambian_phone,
@@ -232,29 +236,50 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 # Basic in-memory login rate limiter (sliding window per client IP + username/tenant)
 LOGIN_RATE_LIMIT_MAX_ATTEMPTS = 5
 LOGIN_RATE_LIMIT_WINDOW_SECONDS = 60
+RATE_LIMIT_GLOBAL_PRUNE_INTERVAL_SECONDS = 30.0
 _login_attempts: Dict[str, List[float]] = {}
+_last_global_prune_time: float = 0.0
+
+
+def get_trusted_proxy_count() -> int:
+    raw = os.getenv("TRUSTED_PROXY_COUNT", "0").strip()
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 0
 
 
 def get_client_ip(request: Request) -> str:
-    """Extract client IP; use first hop in X-Forwarded-For only when TRUST_PROXY=true."""
-    trust_proxy = os.getenv("TRUST_PROXY", "").strip().lower() in ("true", "1", "yes")
-    if trust_proxy:
+    """
+    Extract client IP using TRUSTED_PROXY_COUNT (int, default 0).
+    With 0: ignore X-Forwarded-For entirely and use request.client.host.
+    With N > 0: use the Nth entry counting from the RIGHT of X-Forwarded-For
+    (the entry appended by your own trusted proxy); if there are fewer than N entries,
+    fall back to request.client.host. Never use the leftmost entry.
+    """
+    trusted_count = get_trusted_proxy_count()
+    if trusted_count > 0:
         xff = request.headers.get("x-forwarded-for")
         if xff:
             parts = [p.strip() for p in xff.split(",") if p.strip()]
-            if parts:
-                return parts[0]
+            if len(parts) >= trusted_count:
+                return parts[-trusted_count]
     if request.client and request.client.host:
         return request.client.host
     return "local"
 
 
 def reset_login_rate_limiter() -> None:
+    global _last_global_prune_time
     _login_attempts.clear()
+    _last_global_prune_time = 0.0
 
 
-def _prune_expired_login_attempts(now: float) -> None:
-    """Prune expired attempt timestamps and delete empty keys so the dictionary cannot grow unbounded."""
+def _prune_expired_login_attempts(now: float, force: bool = False) -> None:
+    """Prune expired attempt timestamps across all keys at most once per 30 seconds (or when force=True)."""
+    global _last_global_prune_time
+    if not force and (now - _last_global_prune_time < RATE_LIMIT_GLOBAL_PRUNE_INTERVAL_SECONDS):
+        return
     window_start = now - LOGIN_RATE_LIMIT_WINDOW_SECONDS
     keys_to_remove = []
     for k, timestamps in list(_login_attempts.items()):
@@ -265,23 +290,28 @@ def _prune_expired_login_attempts(now: float) -> None:
             keys_to_remove.append(k)
     for k in keys_to_remove:
         _login_attempts.pop(k, None)
+    _last_global_prune_time = now
 
 
 def _check_login_rate_limit(key: str) -> None:
     now = time.monotonic()
     _prune_expired_login_attempts(now)
-    history = _login_attempts.get(key, [])
+    window_start = now - LOGIN_RATE_LIMIT_WINDOW_SECONDS
+    history = [ts for ts in _login_attempts.get(key, []) if ts > window_start]
     if len(history) >= LOGIN_RATE_LIMIT_MAX_ATTEMPTS:
+        _login_attempts[key] = history
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail="Too many failed login attempts. Please try again later.",
         )
+    _login_attempts[key] = history
 
 
 def _record_failed_login(key: str) -> None:
     now = time.monotonic()
     _prune_expired_login_attempts(now)
-    history = _login_attempts.get(key, [])
+    window_start = now - LOGIN_RATE_LIMIT_WINDOW_SECONDS
+    history = [ts for ts in _login_attempts.get(key, []) if ts > window_start]
     history.append(now)
     _login_attempts[key] = history
 
@@ -1288,6 +1318,38 @@ def initiate_mobile_money_payment(
         )
     except HTTPException:
         raise
+    except LencoConfigError as exc:
+        logger.error(
+            "Lenco collect_mobile_money configuration error for ref=%s: %s",
+            attempt_ref,
+            exc.__class__.__name__,
+        )
+        bind_session_to_tenant(db, tenant_id)
+        attempt_in_db = (
+            db.query(PaymentAttempt)
+            .filter(
+                PaymentAttempt.id == new_attempt.id,
+                PaymentAttempt.tenant_id == tenant_id,
+            )
+            .with_for_update()
+            .first()
+        )
+        order_in_db = (
+            db.query(Order)
+            .filter(Order.id == order.id, Order.tenant_id == tenant_id)
+            .with_for_update()
+            .first()
+        )
+        if attempt_in_db is not None:
+            attempt_in_db.status = "failed"
+            attempt_in_db.updated_at = datetime.now(timezone.utc)
+        if order_in_db is not None:
+            order_in_db.payment_status = "failed"
+        db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Payment service unavailable, contact support",
+        )
     except LencoRejectedError as exc:
         logger.warning(
             "Lenco collect_mobile_money rejected for ref=%s: %s",
@@ -1316,13 +1378,14 @@ def initiate_mobile_money_payment(
         if order_in_db is not None:
             order_in_db.payment_status = "failed"
         db.commit()
+        detail_msg = str(exc)[:200] if str(exc) else "Payment collection was rejected by provider"
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=str(exc) or "Payment collection was rejected by provider",
+            detail=detail_msg,
         )
-    except (LencoUnavailableError, Exception) as exc:
+    except (LencoConflictError, LencoUnavailableError, Exception) as exc:
         logger.error(
-            "Lenco collect_mobile_money unavailable for ref=%s: %s",
+            "Lenco collect_mobile_money unavailable/conflict for ref=%s: %s",
             attempt_ref,
             exc,
             exc_info=True,

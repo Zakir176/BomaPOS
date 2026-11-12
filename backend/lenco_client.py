@@ -26,14 +26,28 @@ class LencoError(RuntimeError):
     pass
 
 
-class LencoRejectedError(LencoError):
-    """Raised for HTTP 4xx client errors from Lenco (e.g. invalid payload, rejected prompt, duplicate)."""
+class LencoConfigError(LencoError):
+    """Raised for authentication/authorization misconfigurations from Lenco (e.g. HTTP 401/403)."""
     pass
 
 
 class LencoUnavailableError(LencoError):
-    """Raised for timeouts, network connection failures, or HTTP 5xx provider errors."""
+    """Raised for timeouts, network connection failures, HTTP 408/429, or HTTP 5xx provider errors."""
     pass
+
+
+class LencoConflictError(LencoUnavailableError):
+    """Raised for HTTP 409 conflict responses from Lenco (e.g. duplicate reference already processing)."""
+    pass
+
+
+class LencoRejectedError(LencoError):
+    """Raised for HTTP 4xx client errors from Lenco (e.g. invalid payload, rejected prompt). Message capped at 200 chars."""
+    def __init__(self, message: str = ""):
+        msg = str(message)
+        if len(msg) > 200:
+            msg = msg[:200]
+        super().__init__(msg)
 
 
 def mask_phone(phone: str) -> str:
@@ -301,35 +315,60 @@ class LiveLencoClient(LencoClient):
                     headers=self._headers(),
                 )
                 if 400 <= resp.status_code < 500:
-                    err_msg = ""
-                    try:
-                        err_body = resp.json()
-                        err_msg = str(
-                            err_body.get("message")
-                            or err_body.get("detail")
-                            or err_body.get("error")
-                            or ""
+                    if resp.status_code in (408, 429):
+                        logger.warning(
+                            "Lenco collect_mobile_money retriable 4xx error (status=%d) for ref=%s",
+                            resp.status_code,
+                            reference,
                         )
-                    except Exception:
-                        pass
-                    if not err_msg:
-                        err_msg = f"Payment request rejected by Lenco ({resp.status_code})"
-                    err_msg = re.sub(
-                        r"\b(\+?260\d{9}|0\d{9})\b",
-                        lambda m: mask_phone(m.group(0)),
-                        err_msg,
-                    )
-                    logger.warning(
-                        "Lenco collect_mobile_money 4xx rejection for ref=%s (phone=%s): %s",
-                        reference,
-                        mask_phone(formatted_phone),
-                        err_msg,
-                    )
-                    raise LencoRejectedError(err_msg)
+                        raise LencoUnavailableError(
+                            f"Payment provider rate limited or timed out ({resp.status_code})"
+                        )
+                    elif resp.status_code in (401, 403):
+                        logger.error(
+                            "Lenco collect_mobile_money configuration error (status=%d) for ref=%s",
+                            resp.status_code,
+                            reference,
+                        )
+                        raise LencoConfigError("Lenco API authentication or permission misconfigured")
+                    elif resp.status_code == 409:
+                        logger.warning(
+                            "Lenco collect_mobile_money conflict (status=409) for ref=%s",
+                            reference,
+                        )
+                        raise LencoConflictError("Payment provider returned conflict (409)")
+                    else:
+                        err_msg = ""
+                        try:
+                            err_body = resp.json()
+                            err_msg = str(
+                                err_body.get("message")
+                                or err_body.get("detail")
+                                or err_body.get("error")
+                                or ""
+                            )
+                        except Exception:
+                            pass
+                        if not err_msg:
+                            err_msg = f"Payment request rejected by Lenco ({resp.status_code})"
+                        err_msg = re.sub(
+                            r"\b(\+?260\d{9}|0\d{9})\b",
+                            lambda m: mask_phone(m.group(0)),
+                            err_msg,
+                        )
+                        if len(err_msg) > 200:
+                            err_msg = err_msg[:200]
+                        logger.warning(
+                            "Lenco collect_mobile_money 4xx rejection for ref=%s (phone=%s): %s",
+                            reference,
+                            mask_phone(formatted_phone),
+                            err_msg,
+                        )
+                        raise LencoRejectedError(err_msg)
 
                 resp.raise_for_status()
                 body = resp.json()
-        except LencoRejectedError:
+        except (LencoRejectedError, LencoConfigError, LencoUnavailableError):
             raise
         except (httpx.TimeoutException, httpx.NetworkError, httpx.ConnectError) as exc:
             logger.error(
