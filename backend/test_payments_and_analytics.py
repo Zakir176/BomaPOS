@@ -32,6 +32,8 @@ from main import (
 from database import SessionLocal, bind_session_to_tenant
 from lenco_client import (
     LiveLencoClient,
+    LencoConfigError,
+    LencoConflictError,
     LencoRejectedError,
     LencoUnavailableError,
     compute_lenco_webhook_signature,
@@ -1684,6 +1686,7 @@ def test_failure_isolation_per_attempt_and_cross_tenant():
 
 
 def test_error_classification_rejected_vs_unavailable():
+    """Verify collect_mobile_money error classification with mock client across all error classes."""
     seed()
     res_cashier = client.post(
         "/api/auth/login",
@@ -1694,20 +1697,22 @@ def test_error_classification_rejected_vs_unavailable():
     res_menu = client.get("/api/menu", headers=headers).json()
     item = res_menu[0]
 
-    # --- Test A: LencoRejectedError ---
+    # --- Test A: LencoRejectedError (other 4xx, message capped at 200 chars) ---
     o1 = client.post(
         "/api/orders",
         json={"payment_method": "mobile_money", "items": [{"menu_item_id": item["id"], "quantity": 1}]},
         headers=headers,
     ).json()["id"]
 
-    mock_lenco_client.set_next_error(LencoRejectedError("Phone number not registered on Airtel Money"))
+    long_rejection_msg = "Phone number not registered on Airtel Money: " + "X" * 300
+    mock_lenco_client.set_next_error(LencoRejectedError(long_rejection_msg))
     res_rej = client.post(
         "/api/payments/mobile-money/initiate",
         json={"order_id": o1, "phone": "0977123456", "operator": "airtel"},
         headers=headers,
     )
     assert res_rej.status_code == 400
+    assert len(res_rej.json()["detail"]) <= 200
     assert "Phone number not registered on Airtel Money" in res_rej.json()["detail"]
 
     # Verify attempt is 'failed' and order is 'failed'
@@ -1728,14 +1733,14 @@ def test_error_classification_rejected_vs_unavailable():
     assert res_retry.status_code == 200
     assert res_retry.json()["status"] in ("pay-offline", "pending", "otp-required")
 
-    # --- Test B: LencoUnavailableError ---
+    # --- Test B: LencoUnavailableError (408, 429, timeouts -> 502, attempt left 'initiating') ---
     o2 = client.post(
         "/api/orders",
         json={"payment_method": "mobile_money", "items": [{"menu_item_id": item["id"], "quantity": 1}]},
         headers=headers,
     ).json()["id"]
 
-    mock_lenco_client.set_next_error(LencoUnavailableError("Payment provider gateway timed out"))
+    mock_lenco_client.set_next_error(LencoUnavailableError("Payment provider rate limited or timed out (429)"))
     res_unav = client.post(
         "/api/payments/mobile-money/initiate",
         json={"order_id": o2, "phone": "0977123456", "operator": "airtel"},
@@ -1759,6 +1764,101 @@ def test_error_classification_rejected_vs_unavailable():
     )
     assert res_block.status_code == 409
     assert "already in progress" in res_block.json()["detail"]
+
+    # --- Test C: LencoConfigError (401/403 -> 503, attempt marked 'failed', generic detail, no secrets) ---
+    o3 = client.post(
+        "/api/orders",
+        json={"payment_method": "mobile_money", "items": [{"menu_item_id": item["id"], "quantity": 1}]},
+        headers=headers,
+    ).json()["id"]
+
+    mock_lenco_client.set_next_error(LencoConfigError("Lenco secret token is invalid or expired: secret-12345"))
+    res_cfg = client.post(
+        "/api/payments/mobile-money/initiate",
+        json={"order_id": o3, "phone": "0977123456", "operator": "airtel"},
+        headers=headers,
+    )
+    assert res_cfg.status_code == 503
+    assert res_cfg.json()["detail"] == "Payment service unavailable, contact support"
+    # Never echo the provider's sensitive text!
+    assert "secret" not in res_cfg.text
+    assert "expired" not in res_cfg.text
+
+    # Attempt is marked 'failed' because no prompt was sent
+    db = SessionLocal()
+    bind_session_to_tenant(db, TENANT_A_ID)
+    att_cfg = db.query(PaymentAttempt).filter(PaymentAttempt.order_id == o3).first()
+    assert att_cfg.status == "failed"
+    ord_cfg = db.query(Order).filter(Order.id == o3).first()
+    assert ord_cfg.payment_status == "failed"
+    db.close()
+
+    # --- Test D: LencoConflictError (409 -> 502, attempt left 'initiating' for reconciliation) ---
+    o4 = client.post(
+        "/api/orders",
+        json={"payment_method": "mobile_money", "items": [{"menu_item_id": item["id"], "quantity": 1}]},
+        headers=headers,
+    ).json()["id"]
+
+    mock_lenco_client.set_next_error(LencoConflictError("Payment reference conflict / already exists (409)"))
+    res_conf = client.post(
+        "/api/payments/mobile-money/initiate",
+        json={"order_id": o4, "phone": "0977123456", "operator": "airtel"},
+        headers=headers,
+    )
+    assert res_conf.status_code == 502
+    assert "Payment provider timed out or returned an error" in res_conf.json()["detail"]
+
+    # Attempt is left 'initiating' so reconciliation will query Lenco by reference
+    db = SessionLocal()
+    bind_session_to_tenant(db, TENANT_A_ID)
+    att_conf = db.query(PaymentAttempt).filter(PaymentAttempt.order_id == o4).first()
+    assert att_conf.status == "initiating"
+    db.close()
+
+
+def test_live_lenco_client_status_classification():
+    """Verify LiveLencoClient maps HTTP status codes to LencoError subclasses."""
+    from unittest.mock import MagicMock, patch
+    live_client = LiveLencoClient(base_url="https://api.lenco.co/access/v2", api_token="test-tok")
+
+    def make_mock_post(status_code: int, json_data: dict):
+        mock_resp = MagicMock()
+        mock_resp.status_code = status_code
+        mock_resp.json.return_value = json_data
+        return mock_resp
+
+    with patch("httpx.Client.post") as mock_post:
+        # 408 -> LencoUnavailableError
+        mock_post.return_value = make_mock_post(408, {"message": "Request timeout"})
+        with pytest.raises(LencoUnavailableError):
+            live_client.collect_mobile_money(reference="ref-408", phone="0977123456", operator="airtel", amount_ngwee=1000)
+
+        # 429 -> LencoUnavailableError
+        mock_post.return_value = make_mock_post(429, {"message": "Too many requests"})
+        with pytest.raises(LencoUnavailableError):
+            live_client.collect_mobile_money(reference="ref-429", phone="0977123456", operator="airtel", amount_ngwee=1000)
+
+        # 401 -> LencoConfigError
+        mock_post.return_value = make_mock_post(401, {"message": "Unauthorized secret token"})
+        with pytest.raises(LencoConfigError):
+            live_client.collect_mobile_money(reference="ref-401", phone="0977123456", operator="airtel", amount_ngwee=1000)
+
+        # 403 -> LencoConfigError
+        mock_post.return_value = make_mock_post(403, {"message": "Forbidden access"})
+        with pytest.raises(LencoConfigError):
+            live_client.collect_mobile_money(reference="ref-403", phone="0977123456", operator="airtel", amount_ngwee=1000)
+
+        # 409 -> LencoConflictError (subclass of LencoUnavailableError)
+        mock_post.return_value = make_mock_post(409, {"message": "Conflict duplicate reference"})
+        with pytest.raises(LencoConflictError):
+            live_client.collect_mobile_money(reference="ref-409", phone="0977123456", operator="airtel", amount_ngwee=1000)
+
+        # other 4xx (e.g. 422) with long message -> LencoRejectedError capped at 200 chars
+        mock_post.return_value = make_mock_post(422, {"message": "Invalid param: " + "X" * 300})
+        with pytest.raises(LencoRejectedError) as exc_info:
+            live_client.collect_mobile_money(reference="ref-422", phone="0977123456", operator="airtel", amount_ngwee=1000)
+        assert len(str(exc_info.value)) <= 200
 
 
 if __name__ == "__main__":
