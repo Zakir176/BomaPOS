@@ -332,3 +332,169 @@ def test_lenco_webhook_rejects_unsigned_requests():
     )
     assert res.status_code == 401
 
+def test_login_missing_tenant_slug_returns_generic_401():
+    """Verify login without tenant_slug fails with the exact same generic 401 as a wrong password."""
+    seed()
+    reset_login_rate_limiter()
+
+    # 1. Baseline: wrong password returns generic 401
+    res_wrong_pw = client.post(
+        "/api/auth/login",
+        json={"tenant_slug": "aunts-lusaka", "username": "aunt", "password": "wrong-password"},
+    )
+    assert res_wrong_pw.status_code == 401
+    expected_error = res_wrong_pw.json()
+    assert expected_error["detail"] == "Invalid tenant, username, or password"
+
+    # 2. Missing tenant_slug field entirely returns the exact same 401
+    res1 = client.post(
+        "/api/auth/login",
+        json={"username": "aunt", "password": "owner123"},
+    )
+    assert res1.status_code == 401
+    assert res1.json() == expected_error
+
+    # 3. Empty tenant_slug string returns the exact same 401
+    res2 = client.post(
+        "/api/auth/login",
+        json={"tenant_slug": "", "username": "aunt", "password": "owner123"},
+    )
+    assert res2.status_code == 401
+    assert res2.json() == expected_error
+
+    # 4. Whitespace-only tenant_slug returns the exact same 401
+    res3 = client.post(
+        "/api/auth/login",
+        json={"tenant_slug": "   ", "username": "aunt", "password": "owner123"},
+    )
+    assert res3.status_code == 401
+    assert res3.json() == expected_error
+
+
+def test_refresh_token_reuse_detection_revokes_all_user_tokens():
+    """Presenting an already-revoked refresh token revokes all active refresh tokens for that user and returns 401."""
+    seed()
+    reset_login_rate_limiter()
+
+    # Step 1: User logs in and receives refresh token 1
+    res_login = client.post(
+        "/api/auth/login",
+        json={"tenant_slug": "aunts-lusaka", "username": "cashier1", "password": "cashier123"},
+    )
+    assert res_login.status_code == 200
+    token1 = res_login.json()["refresh_token"]
+
+    # Step 2: User rotates token 1 -> receives refresh token 2
+    res_rotate = client.post(
+        "/api/auth/refresh",
+        json={"refresh_token": token1},
+    )
+    assert res_rotate.status_code == 200
+    token2 = res_rotate.json()["refresh_token"]
+
+    # Verify in DB: token 1 is revoked, token 2 is active
+    admin_db = AdminSessionLocal()
+    try:
+        row1 = admin_db.query(RefreshToken).filter(RefreshToken.token_hash == hash_refresh_token(token1)).first()
+        row2 = admin_db.query(RefreshToken).filter(RefreshToken.token_hash == hash_refresh_token(token2)).first()
+        assert row1 is not None and row1.revoked_at is not None
+        assert row2 is not None and row2.revoked_at is None
+    finally:
+        admin_db.close()
+
+    # Step 3: Adversary attempts to reuse already-revoked token 1
+    res_reuse = client.post(
+        "/api/auth/refresh",
+        json={"refresh_token": token1},
+    )
+    assert res_reuse.status_code == 401
+
+    # Step 4: Verify in DB: ALL active refresh tokens for this user are now revoked
+    admin_db = AdminSessionLocal()
+    try:
+        row2_after = admin_db.query(RefreshToken).filter(RefreshToken.token_hash == hash_refresh_token(token2)).first()
+        assert row2_after is not None
+        assert row2_after.revoked_at is not None, "Token 2 must be revoked by reuse detection!"
+    finally:
+        admin_db.close()
+
+    # Step 5: Legitimate user attempting to use token 2 now fails with 401
+    res_token2_fail = client.post(
+        "/api/auth/refresh",
+        json={"refresh_token": token2},
+    )
+    assert res_token2_fail.status_code == 401
+
+
+def test_rate_limiter_spoofed_xff_ignored_when_trust_proxy_unset_and_prunes_expired_keys():
+    """Verify requests with spoofed X-Forwarded-For are ignored when TRUST_PROXY is unset, and expired rate-limit keys are pruned."""
+    import time
+    from main import _login_attempts, _prune_expired_login_attempts
+
+    reset_login_rate_limiter()
+
+    # 1. When TRUST_PROXY is UNSET, spoofed X-Forwarded-For is ignored
+    os.environ.pop("TRUST_PROXY", None)
+    res_unset = client.post(
+        "/api/auth/login",
+        headers={"X-Forwarded-For": "203.0.113.195, 70.41.3.18"},
+        json={"tenant_slug": "aunts-lusaka", "username": "aunt", "password": "wrong-password"},
+    )
+    assert res_unset.status_code == 401
+    # Spoofed IP must NOT appear in rate limiter keys
+    assert not any("203.0.113.195" in k for k in _login_attempts.keys())
+    assert any("testclient:aunts-lusaka:aunt" in k for k in _login_attempts.keys())
+
+    # 2. When TRUST_PROXY is explicitly 'false', spoofed X-Forwarded-For is also ignored
+    reset_login_rate_limiter()
+    os.environ["TRUST_PROXY"] = "false"
+    res_false = client.post(
+        "/api/auth/login",
+        headers={"X-Forwarded-For": "203.0.113.195, 70.41.3.18"},
+        json={"tenant_slug": "aunts-lusaka", "username": "aunt", "password": "wrong-password"},
+    )
+    assert res_false.status_code == 401
+    assert not any("203.0.113.195" in k for k in _login_attempts.keys())
+
+    # 3. When TRUST_PROXY is 'true', first hop appended by proxy is used
+    reset_login_rate_limiter()
+    os.environ["TRUST_PROXY"] = "true"
+    res_true = client.post(
+        "/api/auth/login",
+        headers={"X-Forwarded-For": "203.0.113.195, 70.41.3.18"},
+        json={"tenant_slug": "aunts-lusaka", "username": "aunt", "password": "wrong-password"},
+    )
+    assert res_true.status_code == 401
+    expected_trusted_key = "203.0.113.195:aunts-lusaka:aunt"
+    assert expected_trusted_key in _login_attempts
+    assert len(_login_attempts[expected_trusted_key]) == 1
+
+    # 4. Prune expired keys: test both automatic pruning on request and helper pruning
+    now = time.monotonic()
+    # Inject an expired key and a key with mixed timestamps
+    _login_attempts["stale-expired-client:tenant:user"] = [now - 120.0, now - 65.0]
+    _login_attempts["mixed-client:tenant:user"] = [now - 80.0, now - 10.0]
+
+    assert "stale-expired-client:tenant:user" in _login_attempts
+    assert len(_login_attempts["mixed-client:tenant:user"]) == 2
+
+    # Making a new request automatically triggers _prune_expired_login_attempts
+    client.post(
+        "/api/auth/login",
+        json={"tenant_slug": "aunts-lusaka", "username": "aunt", "password": "wrong-password"},
+    )
+
+    # Fully expired key must be completely pruned
+    assert "stale-expired-client:tenant:user" not in _login_attempts
+    # Mixed key must have only the fresh timestamp (< 60s)
+    assert "mixed-client:tenant:user" in _login_attempts
+    assert len(_login_attempts["mixed-client:tenant:user"]) == 1
+
+    # Direct helper test for any remaining edge cases
+    _login_attempts["manual-stale:t:u"] = [now - 90.0]
+    _prune_expired_login_attempts(now)
+    assert "manual-stale:t:u" not in _login_attempts
+
+    # Clean up environment
+    os.environ.pop("TRUST_PROXY", None)
+    reset_login_rate_limiter()
